@@ -1,0 +1,49 @@
+rich_coins_wallet:
+  id: 1
+  owner_type: User
+  owner_id: 1
+  asset_code: coins
+  balance: 1000
+  metadata: {}
+  created_at: <%= 30.days.ago %>
+  updated_at: <%= 1.day.ago %>
+
+rich_gems_wallet:
+  id: 2
+  owner_type: User
+  owner_id: 1
+  asset_code: gems
+  balance: 50
+  metadata: {}
+  created_at: <%= 20.days.ago %>
+  updated_at: <%= 1.day.ago %>
+
+poor_coins_wallet:
+  id: 3
+  owner_type: User
+  owner_id: 2
+  asset_code: coins
+  balance: 5
+  metadata: {}
+  created_at: <%= 15.days.ago %>
+  updated_at: <%= 1.day.ago %>
+
+empty_coins_wallet:
+  id: 4
+  owner_type: User
+  owner_id: 3
+  asset_code: coins
+  balance: 0
+  metadata: {}
+  created_at: <%= 1.day.ago %>
+  updated_at: <%= 1.day.ago %>
+
+peer_coins_wallet:
+  id: 5
+  owner_type: User
+  owner_id: 4
+  asset_code: coins
+  balance: 120
+  metadata: {}
+  created_at: <%= 10.days.ago %>
+  updated_at: <%= 1.day.ago %>

@@ -1,0 +1,3 @@
+module Wallets
+  VERSION: String
+end

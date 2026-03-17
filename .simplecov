@@ -1,0 +1,37 @@
+# frozen_string_literal: true
+
+# SimpleCov configuration file (auto-loaded before test suite)
+# This keeps test_helper.rb clean and follows best practices
+
+SimpleCov.start do
+  # Use SimpleFormatter for terminal-only output (no HTML generation)
+  formatter SimpleCov::Formatter::SimpleFormatter
+
+  # Track coverage for the lib directory (gem source code)
+  add_filter "/test/"
+  add_filter "/lib/generators/"
+
+  # Track Ruby files in lib directory
+  track_files "lib/**/*.rb"
+
+  # Enable branch coverage for more detailed metrics
+  enable_coverage :branch
+
+  # Keep the gate focused on the runtime wallet core, not install scaffolding.
+  minimum_coverage line: 80, branch: 50
+
+  # Disambiguate parallel test runs
+  command_name "Job #{ENV['TEST_ENV_NUMBER']}" if ENV['TEST_ENV_NUMBER']
+end
+
+# Print coverage summary to terminal after tests complete
+SimpleCov.at_exit do
+  SimpleCov.result.format!
+  puts "\n" + "=" * 60
+  puts "COVERAGE SUMMARY"
+  puts "=" * 60
+  puts "Line Coverage:   #{SimpleCov.result.covered_percent.round(2)}%"
+  branch_coverage = SimpleCov.result.coverage_statistics[:branch]&.percent&.round(2) || "N/A"
+  puts "Branch Coverage: #{branch_coverage}%"
+  puts "=" * 60
+end

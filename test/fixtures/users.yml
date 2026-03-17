@@ -1,0 +1,27 @@
+rich_user:
+  id: 1
+  email: rich@example.com
+  name: Rich User
+  created_at: <%= 30.days.ago %>
+  updated_at: <%= 1.day.ago %>
+
+poor_user:
+  id: 2
+  email: poor@example.com
+  name: Poor User
+  created_at: <%= 15.days.ago %>
+  updated_at: <%= 1.day.ago %>
+
+new_user:
+  id: 3
+  email: new@example.com
+  name: New User
+  created_at: <%= 1.day.ago %>
+  updated_at: <%= 1.day.ago %>
+
+peer_user:
+  id: 4
+  email: peer@example.com
+  name: Peer User
+  created_at: <%= 10.days.ago %>
+  updated_at: <%= 1.day.ago %>
