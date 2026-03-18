@@ -96,26 +96,53 @@ user.wallet(:gems).credit(5, category: :top_up)
 
 ## Example
 
+Here is a more relatable money flow for a home-cleaning app:
+
 ```ruby
 class User < ApplicationRecord
-  has_wallets default_asset: :eur
+  has_wallets default_asset: :eur_cents
 end
 
-buyer = User.find(1)
-seller = User.find(2)
+class Platform < ApplicationRecord
+  has_wallets default_asset: :eur_cents
+end
 
-buyer.wallet(:eur).credit(10_000, category: :top_up, metadata: { source: "card" })
-buyer.wallet(:eur).debit(2_500, category: :purchase, metadata: { order_id: 42 })
+sara = User.find(1)      # customer
+lucia = User.find(2)     # cleaner
+platform = Platform.first
 
-buyer.wallet(:eur).transfer_to(
-  seller.wallet(:eur),
-  1_800,
-  category: :marketplace_sale,
-  metadata: { order_id: 42 }
+# Sara books a cleaning and tops up her wallet
+sara.wallet.credit(10_000, category: :top_up, metadata: { source: "card" })
+
+# Sara books a 2-hour cleaning for €60.00
+booking_total = 6_000
+platform_fee = 900
+cleaner_payout = booking_total - platform_fee
+
+# Sara pays the platform the gross booking price
+charge = sara.wallet.transfer_to(
+  platform.wallet,
+  booking_total,
+  category: :cleaning_booking_charge,
+  metadata: { booking_id: 42, cleaner_id: lucia.id }
 )
 
-buyer.wallet(:wood).credit(50, category: :quest_reward)
-buyer.wallet(:wood).debit(10, category: :crafting)
+# The app later pays Lucia the net amount and keeps its fee
+payout = platform.wallet.transfer_to(
+  lucia.wallet,
+  cleaner_payout,
+  category: :cleaner_payout,
+  metadata: {
+    booking_id: 42,
+    customer_id: sara.id,
+    gross_transfer_id: charge.id,
+    platform_fee: platform_fee
+  }
+)
+
+# Query the linked transfer records later
+charge.outbound_transaction
+payout.inbound_transactions
 ```
 
 Amounts are always integers. For money, store the smallest unit like cents. For games, store whole resource units.
@@ -188,6 +215,23 @@ transfer.outbound_transaction
 transfer.inbound_transactions
 ```
 
+`category:` on `transfer_to` describes the **business meaning of the transfer itself**. The ledger entries created underneath are still recorded as `transfer_out` and `transfer_in`, and the original transfer category is mirrored into transaction metadata as `transfer_category`.
+
+That means you can query transfers directly for business flows:
+
+```ruby
+user.wallet.outgoing_transfers.where(category: :peer_payment)
+user.wallet.incoming_transfers.where(category: :peer_payment)
+```
+
+Or query the ledger legs when you need transaction-level audit data:
+
+```ruby
+user.wallet.history
+    .by_category(:transfer_in)
+    .where("metadata->>'transfer_category' = ?", "peer_payment")
+```
+
 Transfers require both wallets to use the same asset and the same wallet class. `:eur` can move to `:eur`; `:wood` can move to `:wood`; `Wallets::Wallet` cannot transfer directly to `UsageCredits::Wallet`.
 
 > [!NOTE]
@@ -223,12 +267,13 @@ Create or edit `config/initializers/wallets.rb`:
 Wallets.configure do |config|
   config.default_asset = :coins
 
-  # Useful for app-specific business events like games, marketplaces, or rewards.
+  # Useful for direct credit/debit events in your app.
+  # Transfer business categories live on Wallets::Transfer.category.
   config.additional_categories = %w[
     quest_reward
-    marketplace_sale
-    ride_fare
-    peer_payment
+    provider_bonus
+    payout
+    promo_credit
   ]
 
   config.allow_negative_balance = false
@@ -414,50 +459,60 @@ player.wallet(:gold).transfer_to(
 )
 ```
 
-### Marketplace with seller balances
+### Home services booking app
 
-An Etsy/Fiverr-style marketplace where sellers earn and can withdraw:
+A home-services app where the platform collects the customer payment, keeps its fee, and later pays the provider:
 
 ```ruby
 class User < ApplicationRecord
   has_wallets default_asset: :usd_cents
 end
 
-# Order completed — credit seller (minus platform fee)
-order_total = 5000  # $50.00
-platform_fee = (order_total * 0.10).to_i  # 10%
-seller_earnings = order_total - platform_fee
+class Marketplace < ApplicationRecord
+  has_wallets default_asset: :usd_cents
+end
 
-seller.wallet(:usd_cents).credit(
-  seller_earnings,
-  category: :sale,
+sara = User.find(1)        # customer
+lucia = User.find(2)       # cleaner
+booking = Booking.find(42)
+marketplace = Marketplace.first
+
+# Booking completed
+booking_total = 5000  # $50.00
+platform_fee = (booking_total * 0.10).to_i  # 10%
+provider_earnings = booking_total - platform_fee
+
+# Customer pays the marketplace
+charge = sara.wallet(:usd_cents).transfer_to(
+  marketplace.wallet(:usd_cents),
+  booking_total,
+  category: :booking_charge,
   metadata: {
-    order_id: order.id,
-    gross_amount: order_total,
-    platform_fee: platform_fee,
-    buyer_id: buyer.id
+    booking_id: booking.id,
+    provider_id: lucia.id
   }
 )
 
-# Buyer uses store credit
-buyer.wallet(:usd_cents).debit(
-  2000,
-  category: :purchase,
-  metadata: { order_id: order.id }
+# Marketplace pays the cleaner the net amount
+payout = marketplace.wallet(:usd_cents).transfer_to(
+  lucia.wallet(:usd_cents),
+  provider_earnings,
+  category: :provider_payout,
+  metadata: {
+    booking_id: booking.id,
+    gross_amount: booking_total,
+    platform_fee: platform_fee,
+    customer_id: sara.id,
+    booking_charge_transfer_id: charge.id
+  }
 )
 
-# Seller requests payout
-seller.wallet(:usd_cents).debit(
-  seller.wallet(:usd_cents).balance,
+# Cleaner later cashes out to Stripe
+lucia.wallet(:usd_cents).debit(
+  lucia.wallet(:usd_cents).balance,
   category: :payout,
   metadata: { stripe_transfer_id: "tr_xxx" }
 )
-
-# Transaction history for accounting
-seller.wallet(:usd_cents).history.each do |tx|
-  puts "#{tx.created_at}: #{tx.category} #{tx.amount} cents"
-  puts "  Balance: #{tx.balance_before} → #{tx.balance_after}"
-end
 ```
 
 ### Loyalty programs & Reward points
