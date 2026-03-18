@@ -6,7 +6,7 @@ class CreateWalletsTables < ActiveRecord::Migration[7.2]
       t.references :owner, polymorphic: true, null: false
       t.string :asset_code, null: false
       t.bigint :balance, null: false, default: 0
-      t.json :metadata, null: false, default: {}
+      t.send(json_column_type, :metadata, null: false, default: json_column_default)
       t.timestamps
     end
 
@@ -19,7 +19,7 @@ class CreateWalletsTables < ActiveRecord::Migration[7.2]
       t.bigint :amount, null: false
       t.string :category, null: false, default: "transfer"
       t.string :expiration_policy, null: false, default: "preserve"
-      t.json :metadata, null: false, default: {}
+      t.send(json_column_type, :metadata, null: false, default: json_column_default)
       t.timestamps
     end
 
@@ -29,7 +29,7 @@ class CreateWalletsTables < ActiveRecord::Migration[7.2]
       t.string :category, null: false
       t.datetime :expires_at
       t.references :transfer, foreign_key: { to_table: :wallets_transfers }
-      t.json :metadata, null: false, default: {}
+      t.send(json_column_type, :metadata, null: false, default: json_column_default)
       t.timestamps
     end
 
@@ -45,5 +45,19 @@ class CreateWalletsTables < ActiveRecord::Migration[7.2]
     add_index :wallets_transactions, [:wallet_id, :amount], name: "index_wallet_transactions_on_wallet_id_and_amount"
     add_index :wallets_transactions, [:expires_at, :id], name: "index_wallet_transactions_on_expires_at_and_id"
     add_index :wallets_allocations, [:transaction_id, :source_transaction_id], name: "index_wallet_allocations_on_tx_and_source_tx"
+  end
+
+  private
+
+  def json_column_type
+    return :jsonb if connection.adapter_name.downcase.include?("postgresql")
+
+    :json
+  end
+
+  def json_column_default
+    return nil if connection.adapter_name.downcase.include?("mysql")
+
+    {}
   end
 end
