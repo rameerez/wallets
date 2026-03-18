@@ -340,7 +340,7 @@ user.credit_wallet.balance  # => 7000 MB remaining
 ```
 
 > [!TIP]
-> `usage_credits` 1.0 uses `wallets` as its ledger core. If you only need `usage_credits`, you get `wallets` for free underneath. Wallet-level methods like `user.credit_wallet.transfer_to(...)` are still available there, but the transfer DX intentionally lives at the wallet layer rather than the credits DSL.
+> `usage_credits` uses `wallets` as its ledger core. If you only need `usage_credits`, you get `wallets` for free underneath. Wallet-level methods like `user.credit_wallet.transfer_to(...)` are still available there, but the transfer DX intentionally lives at the wallet layer rather than the credits DSL.
 
 ## Real-world examples
 
