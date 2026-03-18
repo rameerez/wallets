@@ -16,15 +16,34 @@ Gem::Specification.new do |spec|
 
   spec.metadata["allowed_push_host"] = "https://rubygems.org"
   spec.metadata["homepage_uri"] = spec.homepage
-  spec.metadata["source_code_uri"] = spec.homepage
+  spec.metadata["source_code_uri"] = "#{spec.homepage}/tree/main"
   spec.metadata["changelog_uri"] = "#{spec.homepage}/blob/main/CHANGELOG.md"
   spec.metadata["rubygems_mfa_required"] = "true"
 
-  spec.files = Dir.chdir(__dir__) do
-    Dir.glob("**/*", File::FNM_DOTMATCH).reject do |file|
-      file.start_with?(".git/", "coverage/", "dist/", "test/dummy/log/", "test/dummy/tmp/", "test/dummy/storage/") ||
-        file.end_with?(".gem") ||
-        [".", "..", ".DS_Store", "Gemfile.lock", "test/.DS_Store"].include?(file)
+  gemspec = File.basename(__FILE__)
+  spec.files = IO.popen(%w[git ls-files -z], chdir: __dir__, err: IO::NULL) do |ls|
+    ls.readlines("\x0", chomp: true).reject do |file|
+      (file == gemspec) ||
+        file.start_with?(*%w[
+          .aux/
+          .claude/
+          .cursor/
+          .github/
+          bin/
+          coverage/
+          dist/
+          gemfiles/
+          spec/
+          test/
+          tmp/
+        ]) ||
+        %w[
+          .DS_Store
+          .ruby-version
+          Appraisals
+          Gemfile
+          Gemfile.lock
+        ].include?(file)
     end
   end
 
@@ -32,5 +51,5 @@ Gem::Specification.new do |spec|
   spec.executables = spec.files.grep(%r{\Aexe/}) { |file| File.basename(file) }
   spec.require_paths = ["lib"]
 
-  spec.add_dependency "rails", ">= 6.1"
+  spec.add_dependency "rails", ">= 6.1", "< 9.0"
 end

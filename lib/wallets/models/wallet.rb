@@ -88,7 +88,11 @@ module Wallets
     class << self
       def create_for_owner!(owner:, asset_code:, initial_balance: 0, metadata: {})
         initial_balance = normalize_initial_balance(initial_balance)
+        asset_code = normalize_asset_code(asset_code)
         metadata = metadata.respond_to?(:to_h) ? metadata.to_h : {}
+
+        existing_wallet = find_by(owner: owner, asset_code: asset_code)
+        return existing_wallet if existing_wallet.present?
 
         transaction do
           wallet = create!(
@@ -98,19 +102,31 @@ module Wallets
             metadata: metadata
           )
 
-          if initial_balance.to_i.positive?
-            wallet.credit(
-              initial_balance,
-              category: :adjustment,
-              metadata: { reason: "initial_balance" }
-            )
+          if initial_balance.positive?
+            wallet.credit(initial_balance, **initial_balance_credit_attributes)
           end
 
           wallet
+        rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid => error
+          wallet = find_by(owner: owner, asset_code: asset_code)
+          raise error if wallet.nil?
+
+          if record_conflict_due_to_existing_wallet?(error)
+            wallet
+          else
+            raise error
+          end
         end
       end
 
       private
+
+      def initial_balance_credit_attributes
+        {
+          category: :adjustment,
+          metadata: { reason: "initial_balance" }
+        }
+      end
 
       def normalize_initial_balance(value)
         return 0 if value.nil?
@@ -120,6 +136,17 @@ module Wallets
         raise ArgumentError, "Initial balance cannot be negative" if value.negative?
 
         value
+      end
+
+      def normalize_asset_code(value)
+        value.to_s.strip.downcase.presence || raise(ArgumentError, "Asset code is required")
+      end
+
+      def record_conflict_due_to_existing_wallet?(error)
+        return true if error.is_a?(ActiveRecord::RecordNotUnique)
+        return false unless error.is_a?(ActiveRecord::RecordInvalid)
+
+        error.record.errors.of_kind?(:asset_code, :taken)
       end
     end
 
