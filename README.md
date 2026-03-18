@@ -466,12 +466,12 @@ Whether you're building a Starbucks-style loyalty program, credit card rewards, 
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                   Loyalty program flow                       │
+│                   Loyalty program flow                      │
 ├─────────────────────────────────────────────────────────────┤
-│  EARN              │  Purchase, action, referral, promo      │
-│  HOLD              │  Points accumulate, some may expire     │
-│  TRANSFER          │  Gift to family, pool with friends      │
-│  REDEEM            │  Rewards, discounts, gift cards         │
+│  EARN              │  Purchase, action, referral, promo     │
+│  HOLD              │  Points accumulate, some may expire    │
+│  TRANSFER          │  Gift to family, pool with friends     │
+│  REDEEM            │  Rewards, discounts, gift cards        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
