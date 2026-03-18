@@ -62,6 +62,31 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     end
   end
 
+  test "create_for_owner is idempotent for an existing owner and asset" do
+    owner = users(:new_user)
+
+    wallet = Wallets::Wallet.create_for_owner!(
+      owner: owner,
+      asset_code: :ore,
+      initial_balance: 25
+    )
+
+    assert_no_difference -> { Wallets::Wallet.where(owner: owner, asset_code: "ore").count } do
+      same_wallet = Wallets::Wallet.create_for_owner!(
+        owner: owner,
+        asset_code: " ORE ",
+        initial_balance: 75
+      )
+
+      assert_equal wallet.id, same_wallet.id
+    end
+
+    assert_equal 25, wallet.reload.balance
+    assert_equal 1, wallet.transactions.count
+    assert_equal "adjustment", wallet.transactions.sole.category
+    assert_equal "initial_balance", wallet.transactions.sole.metadata["reason"]
+  end
+
   test "negative balances are tracked correctly when enabled" do
     original_setting = Wallets.configuration.allow_negative_balance
     Wallets.configuration.allow_negative_balance = true
