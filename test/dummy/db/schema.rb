@@ -51,15 +51,12 @@ ActiveRecord::Schema[8.1].define(version: 2025_02_12_181807) do
     t.string "asset_code", null: false
     t.string "category", default: "transfer", null: false
     t.datetime "created_at", null: false
+    t.string "expiration_policy", default: "preserve", null: false
     t.integer "from_wallet_id", null: false
-    t.integer "inbound_transaction_id"
     t.json "metadata", default: {}, null: false
-    t.integer "outbound_transaction_id"
     t.integer "to_wallet_id", null: false
     t.datetime "updated_at", null: false
     t.index ["from_wallet_id"], name: "index_wallets_transfers_on_from_wallet_id"
-    t.index ["inbound_transaction_id"], name: "index_wallets_transfers_on_inbound_transaction_id"
-    t.index ["outbound_transaction_id"], name: "index_wallets_transfers_on_outbound_transaction_id"
     t.index ["to_wallet_id"], name: "index_wallets_transfers_on_to_wallet_id"
   end
 
@@ -79,8 +76,6 @@ ActiveRecord::Schema[8.1].define(version: 2025_02_12_181807) do
   add_foreign_key "wallets_allocations", "wallets_transactions", column: "transaction_id"
   add_foreign_key "wallets_transactions", "wallets_transfers", column: "transfer_id"
   add_foreign_key "wallets_transactions", "wallets_wallets", column: "wallet_id"
-  add_foreign_key "wallets_transfers", "wallets_transactions", column: "inbound_transaction_id"
-  add_foreign_key "wallets_transfers", "wallets_transactions", column: "outbound_transaction_id"
   add_foreign_key "wallets_transfers", "wallets_wallets", column: "from_wallet_id"
   add_foreign_key "wallets_transfers", "wallets_wallets", column: "to_wallet_id"
 end

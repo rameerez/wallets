@@ -23,6 +23,7 @@ Gem::Specification.new do |spec|
   spec.files = Dir.chdir(__dir__) do
     Dir.glob("**/*", File::FNM_DOTMATCH).reject do |file|
       file.start_with?(".git/", "coverage/", "dist/", "test/dummy/log/", "test/dummy/tmp/", "test/dummy/storage/") ||
+        file.end_with?(".gem") ||
         [".", "..", ".DS_Store", "Gemfile.lock", "test/.DS_Store"].include?(file)
     end
   end
@@ -31,5 +32,5 @@ Gem::Specification.new do |spec|
   spec.executables = spec.files.grep(%r{\Aexe/}) { |file| File.basename(file) }
   spec.require_paths = ["lib"]
 
-  spec.add_dependency "rails", ">= 7.2"
+  spec.add_dependency "rails", ">= 6.1"
 end

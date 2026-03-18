@@ -11,6 +11,7 @@ class Wallets::ConfigurationTest < ActiveSupport::TestCase
     assert_equal false, configuration.allow_negative_balance
     assert_nil configuration.low_balance_threshold
     assert_equal "wallets_", configuration.table_prefix
+    assert_equal :preserve, configuration.transfer_expiration_policy
     assert_nil configuration.on_balance_credited_callback
     assert_nil configuration.on_balance_debited_callback
     assert_nil configuration.on_transfer_completed_callback
@@ -26,11 +27,13 @@ class Wallets::ConfigurationTest < ActiveSupport::TestCase
     configuration.additional_categories = [" quest_reward ", :quest_reward, "", "marketplace_sale"]
     configuration.low_balance_threshold = "25"
     configuration.table_prefix = "custom_"
+    configuration.transfer_expiration_policy = "none"
 
     assert_equal :eur, configuration.default_asset
     assert_equal ["quest_reward", "marketplace_sale"], configuration.additional_categories
     assert_equal 25, configuration.low_balance_threshold
     assert_equal "custom_", configuration.table_prefix
+    assert_equal :none, configuration.transfer_expiration_policy
   end
 
   test "runtime model table names follow the configured table prefix" do
@@ -52,6 +55,7 @@ class Wallets::ConfigurationTest < ActiveSupport::TestCase
     assert_raises(ArgumentError) { configuration.additional_categories = "reward" }
     assert_raises(ArgumentError) { configuration.low_balance_threshold = -1 }
     assert_raises(ArgumentError) { configuration.table_prefix = "" }
+    assert_raises(ArgumentError) { configuration.transfer_expiration_policy = :fixed }
   end
 
   test "stores lifecycle callback blocks" do

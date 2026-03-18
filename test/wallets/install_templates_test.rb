@@ -10,6 +10,9 @@ class Wallets::InstallTemplatesTest < ActiveSupport::TestCase
     assert_includes template, "create_table wallets_table"
     assert_includes template, "add_index wallets_table"
     assert_equal 4, template.scan("t.bigint").size
+    assert_includes template, 't.string :expiration_policy, null: false, default: "preserve"'
+    refute_includes template, "outbound_transaction"
+    refute_includes template, "inbound_transaction"
   end
 
   test "initializer template keeps optional categories and table prefix commented out" do

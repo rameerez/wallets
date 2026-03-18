@@ -18,6 +18,7 @@ class CreateWalletsTables < ActiveRecord::Migration[7.2]
       t.string :asset_code, null: false
       t.bigint :amount, null: false
       t.string :category, null: false, default: "transfer"
+      t.string :expiration_policy, null: false, default: "preserve"
       t.json :metadata, null: false, default: {}
       t.timestamps
     end
@@ -38,9 +39,6 @@ class CreateWalletsTables < ActiveRecord::Migration[7.2]
       t.bigint :amount, null: false
       t.timestamps
     end
-
-    add_reference :wallets_transfers, :outbound_transaction, foreign_key: { to_table: :wallets_transactions }
-    add_reference :wallets_transfers, :inbound_transaction, foreign_key: { to_table: :wallets_transactions }
 
     add_index :wallets_transactions, :category
     add_index :wallets_transactions, :expires_at
