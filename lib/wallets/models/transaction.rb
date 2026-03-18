@@ -4,9 +4,20 @@ module Wallets
   # Transactions are the append-only source of truth for wallet balance changes.
   # Positive rows add value, negative rows consume value, and transfers link both
   # sides of an internal movement through `transfer_id`.
+  #
+  # This class supports embedding: subclasses can override config and table
+  # names without affecting the base Wallets::* behavior.
   class Transaction < ApplicationRecord
+    class_attribute :embedded_table_name, default: nil
+    class_attribute :config_provider, default: -> { Wallets.configuration }
+
     def self.table_name
-      "#{Wallets.configuration.table_prefix}transactions"
+      embedded_table_name || "#{resolved_config.table_prefix}transactions"
+    end
+
+    def self.resolved_config
+      value = config_provider
+      value.respond_to?(:call) ? value.call : value
     end
 
     DEFAULT_CATEGORIES = [
@@ -22,6 +33,17 @@ module Wallets
     ].freeze
     CATEGORIES = DEFAULT_CATEGORIES
 
+    def self.categories
+      extra_categories =
+        if resolved_config.respond_to?(:additional_categories)
+          resolved_config.additional_categories
+        else
+          []
+        end
+
+      (DEFAULT_CATEGORIES + extra_categories).uniq
+    end
+
     belongs_to :wallet, class_name: "Wallets::Wallet"
     belongs_to :transfer, class_name: "Wallets::Transfer", optional: true
 
@@ -36,7 +58,7 @@ module Wallets
              dependent: :destroy
 
     validates :amount, presence: true, numericality: { only_integer: true }
-    validates :category, presence: true, inclusion: { in: ->(_) { categories } }
+    validates :category, presence: true, inclusion: { in: ->(record) { record.class.categories } }
     validate :remaining_amount_cannot_be_negative
 
     before_save :sync_metadata_cache
@@ -47,10 +69,6 @@ module Wallets
     scope :by_category, ->(category) { where(category: category) }
     scope :not_expired, -> { where("expires_at IS NULL OR expires_at > ?", Time.current) }
     scope :expired, -> { where("expires_at < ?", Time.current) }
-
-    def self.categories
-      (DEFAULT_CATEGORIES + Wallets.configuration.additional_categories).uniq
-    end
 
     def metadata
       @indifferent_metadata ||= ActiveSupport::HashWithIndifferentAccess.new(super || {})
@@ -96,8 +114,6 @@ module Wallets
       amount - allocated_amount
     end
 
-    # When negative balances are allowed, a debit can exceed the currently
-    # available positive buckets. The unmatched portion remains "unbacked".
     def unbacked_amount
       return 0 unless debit?
 

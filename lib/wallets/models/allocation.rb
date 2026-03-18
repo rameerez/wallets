@@ -4,9 +4,20 @@ module Wallets
   # Allocations link a negative spend transaction to the positive transactions it
   # consumed from. This is what makes FIFO spending and expiration-aware balances
   # possible without mutating historical transactions.
+  #
+  # This class supports embedding: subclasses can override config and table
+  # names without affecting the base Wallets::* behavior.
   class Allocation < ApplicationRecord
+    class_attribute :embedded_table_name, default: nil
+    class_attribute :config_provider, default: -> { Wallets.configuration }
+
     def self.table_name
-      "#{Wallets.configuration.table_prefix}allocations"
+      embedded_table_name || "#{resolved_config.table_prefix}allocations"
+    end
+
+    def self.resolved_config
+      value = config_provider
+      value.respond_to?(:call) ? value.call : value
     end
 
     belongs_to :spend_transaction, class_name: "Wallets::Transaction", foreign_key: "transaction_id"

@@ -21,6 +21,7 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
       t.string :asset_code, null: false
       t.bigint :amount, null: false
       t.string :category, null: false, default: "transfer"
+      t.string :expiration_policy, null: false, default: "preserve"
       t.send(json_column_type, :metadata, null: false, default: json_column_default)
 
       t.timestamps
@@ -60,10 +61,6 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
     add_index transactions_table, [:expires_at, :id], name: index_name("transactions_on_expires_at_and_id")
     add_index allocations_table, [:transaction_id, :source_transaction_id], name: index_name("allocations_on_tx_and_source_tx")
     add_index transfers_table, [:from_wallet_id, :to_wallet_id, :asset_code], name: index_name("transfers_on_wallets_and_asset")
-
-    # Add these after both tables exist to avoid circular foreign key creation.
-    add_reference transfers_table, :outbound_transaction, type: foreign_key_type, foreign_key: { to_table: transactions_table }
-    add_reference transfers_table, :inbound_transaction, type: foreign_key_type, foreign_key: { to_table: transactions_table }
   end
 
   private

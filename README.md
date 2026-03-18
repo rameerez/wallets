@@ -9,35 +9,105 @@
 
 Use it for:
 
-- Multi-currency balances like `:eur`, `:usd`, or `:gbp`
-- Game resources like `:wood`, `:stone`, `:gems`, or `:gold`
-- Store credit, reward wallets
-- Transferrable usage between users, like a SIM card app: "this plan gives you X GBs per month, you can transfer any unused GBs to other users"
-- Marketplace seller balances and platform credits
-- Gig economy earnings, rider/driver balances, or reward wallets
-- Cashback, loyalty points, store credit, and in-app tokens
+- **Telecom / data plans** — "This plan gives you 10 GB per month, transfer unused data to friends"
+- **Game resources** — Wood, stone, gems, gold, energy — any virtual economy
+- **Multi-currency balances** — EUR, USD, GBP wallets per user
+- **Marketplace balances** — Seller earnings, buyer credits, platform payouts
+- **Rewards & loyalty** — Cashback, points, store credit, referral bonuses
+- **Gig economy** — Driver earnings, rider credits, tip wallets
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         wallets                                 │
+│                                                                 │
+│   The ledger core: balances, transactions, transfers, expiry    │
+│                                                                 │
+│   user.wallet(:gb).credit(10_240, expires_at: month_end)        │
+│   user.wallet(:gb).transfer_to(friend.wallet(:gb), 3_072)       │
+│   user.wallet(:gb).debit(512, category: :network_usage)         │
+│   user.wallet(:gb).balance  # => 6656                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## wallets vs usage_credits — which gem do I need?
+
+Both gems handle balances, but they solve different problems:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      usage_credits                              │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Subscriptions, Credit Packs, Pay Integration, Fulfillment │  │
+│  │  Operations DSL, Pricing, Refunds, Webhook Handling        │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                            │                                    │
+│                            ▼                                    │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                       wallets                              │  │
+│  │    Balance, Credit, Debit, Transfer, Expiration, FIFO,    │  │
+│  │    Audit Trail, Row-Level Locking, Multi-Asset            │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+| Aspect | `wallets` | `usage_credits` |
+|--------|-----------|-----------------|
+| **Core job** | Store and move value | Sell and consume value |
+| **Balance model** | Multi-asset (`:gb`, `:eur`, `:gems`) | Single asset (credits) |
+| **Consumption** | Passive — balance depletes over time | Active — `spend_credits_on(:operation)` |
+| **Transfers** | Built-in between users | Not designed for this |
+| **Subscriptions** | You handle externally | Built-in with Stripe via `pay` |
+| **Operations DSL** | None | `operation :send_email { costs 1.credit }` |
+| **Best for** | B2C: games, telecom, rewards, marketplaces | B2B: SaaS, APIs, AI apps |
+
+### When to use `wallets` alone
+
+Use `wallets` directly when your product:
+- Needs **multiple asset types** — `user.wallet(:wood)`, `user.wallet(:gold)`, `user.wallet(:eur)`
+- Has **passive consumption** — balance depletes from usage over time (data, minutes, energy)
+- Needs **user-to-user transfers** — gifting, P2P payments, marketplace settlements
+- Manages its own subscription logic — or doesn't need subscriptions at all
+
+### When to use `usage_credits`
+
+Use `usage_credits` when your product:
+- Sells **credits for specific operations** — "Process image costs 10 credits"
+- Needs **Stripe subscriptions** with automatic credit fulfillment
+- Wants the **operations DSL** — `spend_credits_on(:generate_report)`
+- Is a **B2B/SaaS/API product** with usage-based pricing
+
+### When to use both together
+
+For products like a **SIM/telecom app**, you might use both:
+
+```ruby
+# usage_credits handles ACQUISITION (how users get balance)
+subscription_plan :basic_data do
+  stripe_price "price_xyz"
+  gives 10_000.credits.every(:month)  # 10 GB in MB
+end
+
+# wallet-level movement is still available underneath usage_credits
+user.credit_wallet.transfer_to(friend.credit_wallet, 3_000)  # Gift 3 GB
+user.credit_wallet.balance  # => 7000 MB remaining
+```
 
 > [!TIP]
-> If your product is specifically about usage-based credits for SaaS, APIs, or AI apps, [`usage_credits`](https://github.com/rameerez/usage_credits) is probably the better fit. `usage_credits` uses `wallets` underneath, and then adds handy DX ergonomics for credits, fulfillment, pricing, refills, packs, subscriptions, payment flows, and more. The `wallets` gem was extracted from `usage_credits`, and should only be used for when you need something like `usage_credits`, minus the credits-specific overhead. wallets = ledger/balance core; usage_credits = opinionated acquisition/product layer (subscriptions, packs/top-ups, Pay integration, recurring fulfillment)
-
-`wallets` is a good fit for software that needs more than `users.balance += 1`, but does not need a full banking core.
-
-Think:
-
-- Games like Fortnite or FarmVille where users collect and spend different resources
-- Marketplace flows like Etsy or Fiverr where users accrue balances and spend or transfer value internally
-- Reward and gig apps in the style of DoorDash or Uber where users earn balance from actions over time
+> `usage_credits` 1.0 uses `wallets` as its ledger core. If you only need `usage_credits`, you get `wallets` for free underneath. Wallet-level methods like `user.credit_wallet.transfer_to(...)` are still available there, but the transfer DX intentionally lives at the wallet layer rather than the credits DSL.
 
 ## Why this gem
 
-`wallets` is built around a few practical ideas:
+`wallets` gives you more than `users.balance += 1`, but less than a full banking system:
 
-- One owner can have one wallet per asset: `user.wallet(:usd)`, `user.wallet(:eur)`
-- Every balance change is tracked as a transaction
-- Debits allocate against the oldest available credits first, so expiring value gets consumed first
-- Transfers create linked records on both sides
-- Row-level locking protects concurrent debits and transfers
-- Metadata and balance snapshots give you a useful audit trail
+| Feature | What it does |
+|---------|--------------|
+| **Multi-asset** | One wallet per asset: `user.wallet(:usd)`, `user.wallet(:gems)` |
+| **Append-only ledger** | Every balance change is a transaction — no edits, only new entries |
+| **FIFO allocation** | Debits consume oldest credits first (important for expiring balances) |
+| **Linked transfers** | Both sides of a transfer are recorded and queryable |
+| **Row-level locking** | Prevents race conditions and double-spending |
+| **Balance snapshots** | Each transaction records before/after balance for reconciliation |
+| **Rich metadata** | Attach any JSON to transactions for audit and filtering |
 
 ## Quick start
 
@@ -167,10 +237,21 @@ transfer = sender.transfer_to(
 )
 
 transfer.outbound_transaction
-transfer.inbound_transaction
+transfer.inbound_transactions
 ```
 
-Transfers require both wallets to use the same asset. `:eur` can move to `:eur`; `:wood` can move to `:wood`.
+Transfers require both wallets to use the same asset and the same wallet class. `:eur` can move to `:eur`; `:wood` can move to `:wood`; `Wallets::Wallet` cannot transfer directly to `UsageCredits::Wallet`.
+
+> [!NOTE]
+> **Transfer expiration behavior:** Transfers preserve expiration buckets by default. If a single transfer consumes multiple source buckets with different expirations, the receiver gets multiple inbound credit transactions so those expirations remain intact.
+>
+> You can override that per transfer:
+>
+> ```ruby
+> sender.transfer_to(receiver, 100, expiration_policy: :none)           # evergreen on receive
+> sender.transfer_to(receiver, 100, expires_at: 30.days.from_now)       # fixed expiration on receive
+> sender.transfer_to(receiver, 100, expiration_policy: :fixed, expires_at: 30.days.from_now)
+> ```
 
 ### Expiring balances
 
@@ -204,6 +285,7 @@ Wallets.configure do |config|
 
   config.allow_negative_balance = false
   config.low_balance_threshold = 50
+  config.transfer_expiration_policy = :preserve
 end
 ```
 
@@ -246,72 +328,346 @@ Useful fields on `ctx` include:
 - `ctx.category`
 - `ctx.metadata`
 
-## Real-world fit
+## Real-world examples
 
-### Games and virtual economies
+### Telecom / Mobile data app
 
-Games often need more than one balance:
+A SIM card app where users get monthly data and can transfer unused GBs to friends:
 
-- `user.wallet(:wood)`
-- `user.wallet(:stone)`
-- `user.wallet(:gold)`
-- `user.wallet(:gems)`
+```ruby
+class User < ApplicationRecord
+  has_wallets default_asset: :data_mb  # Store in MB for precision
+end
 
-That maps well to strategy and farming games in the vein of OGame or FarmVille, or to games with premium and earned resources like Fortnite-style economies.
+# Monthly plan grants 10 GB (stored as 10,240 MB)
+user.wallet(:data_mb).credit(
+  10_240,
+  category: :monthly_plan,
+  expires_at: 1.month.from_now,
+  metadata: { plan: "basic", period: "2024-03" }
+)
 
-### Marketplaces
+# Network usage consumes data passively
+user.wallet(:data_mb).debit(512, category: :network_usage)
 
-Marketplaces need more than a cached integer:
+# User transfers 3 GB to a friend
+user.wallet(:data_mb).transfer_to(
+  friend.wallet(:data_mb),
+  3_072,
+  category: :gift,
+  metadata: { message: "Here's some extra data!" }
+)
 
-- buyer store credit
-- seller earnings
-- referral bonuses
-- internal transfers
-- auditable transaction history
+user.wallet(:data_mb).balance  # => 6656 MB (6.5 GB remaining)
+```
 
-`wallets` works well for Etsy-style, Fiverr-style, or platform-credit marketplace flows where the app is the source of truth for internal balances.
+> [!NOTE]
+> Store data in the smallest practical unit (MB or KB, not GB as a float). `wallets` uses integers to avoid floating-point issues.
 
-### Reward and gig apps
+### Game economy
 
-Many B2C apps reward users for actions:
+A farming/strategy game with multiple resources:
 
-- completing rides
-- referring a friend
-- finishing a challenge
-- scanning receipts
-- daily streaks
+```ruby
+class Player < ApplicationRecord
+  has_wallets default_asset: :gold
+end
 
-That maps naturally to cashback apps, loyalty products, and DoorDash/Uber/Sweatcoin-style internal earning systems.
+# Quest rewards multiple resources
+player.wallet(:wood).credit(100, category: :quest_reward, metadata: { quest: "forest_patrol" })
+player.wallet(:stone).credit(50, category: :quest_reward)
+player.wallet(:gold).credit(25, category: :quest_reward)
+
+# Crafting consumes resources
+player.wallet(:wood).debit(30, category: :crafting, metadata: { item: "wooden_sword" })
+
+# Premium currency from in-app purchase
+player.wallet(:gems).credit(500, category: :purchase, metadata: { sku: "gem_pack_500" })
+
+# Seasonal event with expiring currency
+player.wallet(:snowflakes).credit(
+  1_000,
+  category: :event_reward,
+  expires_at: Date.new(2024, 1, 7)  # Winter event ends
+)
+
+# Trading between players
+player.wallet(:gold).transfer_to(
+  other_player.wallet(:gold),
+  100,
+  category: :trade,
+  metadata: { item_received: "rare_armor" }
+)
+```
+
+### Marketplace with seller balances
+
+An Etsy/Fiverr-style marketplace where sellers earn and can withdraw:
+
+```ruby
+class User < ApplicationRecord
+  has_wallets default_asset: :usd_cents
+end
+
+# Order completed — credit seller (minus platform fee)
+order_total = 5000  # $50.00
+platform_fee = (order_total * 0.10).to_i  # 10%
+seller_earnings = order_total - platform_fee
+
+seller.wallet(:usd_cents).credit(
+  seller_earnings,
+  category: :sale,
+  metadata: {
+    order_id: order.id,
+    gross_amount: order_total,
+    platform_fee: platform_fee,
+    buyer_id: buyer.id
+  }
+)
+
+# Buyer uses store credit
+buyer.wallet(:usd_cents).debit(
+  2000,
+  category: :purchase,
+  metadata: { order_id: order.id }
+)
+
+# Seller requests payout
+seller.wallet(:usd_cents).debit(
+  seller.wallet(:usd_cents).balance,
+  category: :payout,
+  metadata: { stripe_transfer_id: "tr_xxx" }
+)
+
+# Transaction history for accounting
+seller.wallet(:usd_cents).history.each do |tx|
+  puts "#{tx.created_at}: #{tx.category} #{tx.amount} cents"
+  puts "  Balance: #{tx.balance_before} → #{tx.balance_after}"
+end
+```
+
+### Loyalty programs & Reward points
+
+Whether you're building a Starbucks-style loyalty program, credit card rewards, airline miles, or a Sweatcoin-style earn-from-actions app — it's the same pattern:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   Loyalty program flow                       │
+├─────────────────────────────────────────────────────────────┤
+│  EARN              │  Purchase, action, referral, promo      │
+│  HOLD              │  Points accumulate, some may expire     │
+│  TRANSFER          │  Gift to family, pool with friends      │
+│  REDEEM            │  Rewards, discounts, gift cards         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+```ruby
+class User < ApplicationRecord
+  has_wallets default_asset: :points
+end
+
+# ═══════════════════════════════════════════════════════════
+# EARN — from purchases, actions, referrals
+# ═══════════════════════════════════════════════════════════
+
+# Points from purchase (1 point per dollar)
+user.wallet(:points).credit(
+  order.total_cents / 100,
+  category: :purchase,
+  metadata: { order_id: order.id }
+)
+
+# Bonus points for specific products
+user.wallet(:points).credit(150, category: :bonus_item, metadata: { sku: "featured_product" })
+
+# Referral bonus
+user.wallet(:points).credit(500, category: :referral, metadata: { referred_user_id: friend.id })
+
+# Daily check-in streaks
+user.wallet(:points).credit(50 * streak_multiplier, category: :daily_checkin)
+
+# Receipt scanning (Ibotta-style)
+user.wallet(:points).credit(100, category: :receipt_scan, metadata: { receipt_id: 123 })
+
+# ═══════════════════════════════════════════════════════════
+# EXPIRING PROMOS — use-it-or-lose-it campaigns
+# ═══════════════════════════════════════════════════════════
+
+# Welcome bonus that expires in 30 days
+user.wallet(:points).credit(
+  500,
+  category: :welcome_bonus,
+  expires_at: 30.days.from_now
+)
+
+# Double points weekend (expires Monday)
+user.wallet(:points).credit(
+  200,
+  category: :promo,
+  expires_at: Date.current.next_occurring(:monday),
+  metadata: { campaign: "double_points_weekend" }
+)
+
+# Birthday reward
+user.wallet(:points).credit(
+  1000,
+  category: :birthday,
+  expires_at: 1.month.from_now,
+  metadata: { birthday_year: Date.current.year }
+)
+
+# ═══════════════════════════════════════════════════════════
+# TRANSFER — gift to friends, pool with family
+# ═══════════════════════════════════════════════════════════
+
+# Gift points to another member
+user.wallet(:points).transfer_to(
+  friend.wallet(:points),
+  500,
+  category: :gift,
+  metadata: { message: "Happy birthday!" }
+)
+
+# Family pooling (multiple transfers to a shared account)
+family_members.each do |member|
+  member.wallet(:points).transfer_to(
+    family_pool.wallet(:points),
+    member.wallet(:points).balance,
+    category: :family_pool
+  )
+end
+
+# ═══════════════════════════════════════════════════════════
+# REDEEM — rewards, discounts, cash out
+# ═══════════════════════════════════════════════════════════
+
+# Redeem for a reward
+user.wallet(:points).debit(
+  2500,
+  category: :redemption,
+  metadata: { reward: "free_coffee", reward_id: 42 }
+)
+
+# Redeem for statement credit / gift card
+user.wallet(:points).debit(
+  10_000,
+  category: :cash_out,
+  metadata: { gift_card_code: "XXXX-YYYY", value_cents: 1000 }
+)
+
+# Partial redemption with points + cash
+points_portion = 500
+user.wallet(:points).debit(
+  points_portion,
+  category: :partial_redemption,
+  metadata: { order_id: order.id, points_value_cents: points_portion }
+)
+```
+
+**Loyalty-specific patterns:**
+
+| Pattern | Implementation |
+|---------|----------------|
+| **Tiered earning** | `credit(amount * tier_multiplier, ...)` |
+| **Points expiration** | `expires_at: 1.year.from_now` |
+| **Family pooling** | `transfer_to` family wallet |
+| **Gifting** | `transfer_to` friend's wallet |
+| **Earn + burn in one transaction** | `debit` points, `credit` new promo points |
+| **Points + cash** | `debit` points portion, charge card for remainder |
+
+**Real-world examples this pattern fits:**
+
+- Starbucks Stars
+- Airline miles (Delta SkyMiles, United MileagePlus)
+- Credit card points (Chase Ultimate Rewards, Amex MR)
+- Hotel points (Marriott Bonvoy, Hilton Honors)
+- Retail loyalty (Sephora Beauty Insider, REI Co-op)
+- Cashback apps (Rakuten, Ibotta, Fetch)
+- Fitness rewards (Sweatcoin, Stepn)
+
+### Gig economy / Driver earnings
+
+An Uber/DoorDash-style app with earnings and tips:
+
+```ruby
+class Driver < ApplicationRecord
+  has_wallets default_asset: :usd_cents
+end
+
+# Ride completed
+driver.wallet(:usd_cents).credit(
+  1250,  # $12.50 base fare
+  category: :ride_fare,
+  metadata: { ride_id: ride.id, distance_miles: 5.2 }
+)
+
+# Tip added later
+driver.wallet(:usd_cents).credit(
+  300,  # $3.00 tip
+  category: :tip,
+  metadata: { ride_id: ride.id, rider_id: rider.id }
+)
+
+# Weekly payout
+driver.wallet(:usd_cents).debit(
+  driver.wallet(:usd_cents).balance,
+  category: :weekly_payout,
+  metadata: { payout_date: Date.current, bank_account: "****1234" }
+)
+```
 
 ## Perfect use cases
 
-`wallets` is best for closed-loop value inside your app.
+`wallets` is best for **closed-loop value** inside your app — where the app itself is the source of truth.
 
-Use it when value is created, tracked, spent, and transferred inside your own product, and you want something much more trustworthy than a single integer column.
+| Use case | Example | Why `wallets` fits |
+|----------|---------|-------------------|
+| **Telecom / data plans** | Mobile data that users can share | Multi-asset (`:data_mb`, `:sms`, `:minutes`), transfers, expiration |
+| **Game economies** | FarmVille, Fortnite, OGame | Multiple resources, trading between players |
+| **Marketplaces** | Etsy, Fiverr, Airbnb | Seller earnings, buyer credits, platform settlements |
+| **Rewards / loyalty** | Sweatcoin, credit card points | Points from actions, expiring promos, redemptions |
+| **Gig economy** | Uber, DoorDash | Driver earnings, tips, scheduled payouts |
+| **Multi-currency** | Travel apps, international platforms | Per-currency wallets (`:eur`, `:usd`, `:gbp`) |
+| **Store credit** | Gift cards, refund credits | Simple balance with full audit trail |
 
-- In-game economies with multiple resources like `:wood`, `:stone`, `:gold`, and `:gems`.
-- Marketplace internal balances like seller earnings, buyer credits, referral bonuses, and platform-managed payouts.
-- Rewards, loyalty, cashback, and streak systems where users earn value from actions and redeem it later.
-- Multi-asset apps where one user can hold several balances like `:eur`, `:usd`, `:credits`, or `:gems`.
-- Internal peer-to-peer transfers, gifting, marketplace settlement, and in-app value movement between users.
+**Key signals that `wallets` is the right fit:**
+- Users hold **multiple types of value** (not just one "credits" balance)
+- Users **transfer value to each other** (gifts, trades, P2P payments)
+- Value **expires** (promotional credits, seasonal currencies, data rollovers)
+- You need a **full audit trail** (not just a cached integer)
+- The app is the **source of truth** (not syncing with external ledgers)
 
-It is especially strong when the app itself is the source of truth for the balance ledger.
+## When NOT to use `wallets`
 
-## Anti use cases
+### Use `usage_credits` instead if:
 
-`wallets` is the wrong abstraction when the hard part of the product is external money movement, regulation, or accounting-grade settlement.
+- You're building a **SaaS/API product** with usage-based pricing
+- You need **Stripe subscriptions** with automatic credit fulfillment
+- You want an **operations DSL** like `spend_credits_on(:generate_report)`
+- Your users **buy credits to perform specific actions** (not hold transferable balances)
 
-- Bank-like money infrastructure with transfers to and from bank rails, cards, ACH, or SEPA.
-- Regulated stored-value products where KYC, AML, licensing, or custody are core requirements.
-- Escrow and held-balance systems with pending, available, reserved, or delayed-release states.
-- Multi-currency conversion systems where FX rates and conversion rules are first-class concerns.
-- Full accounting engines with charts of accounts, journal entries, financial reporting, and reconciliation.
-- Blockchain or crypto-style systems where consensus, custody, and cryptographic guarantees matter.
-- Extremely simple apps that only need one cached counter and do not care about history, auditability, transfer records, or expirations.
+See [usage_credits](https://github.com/rameerez/usage_credits) — it uses `wallets` underneath.
 
-If the question is "how do I safely track balances and transfers inside my app?", this gem is a good fit.
+### Use something else entirely if:
 
-If the question is "how do I build payments infrastructure or a banking system?", this gem is not enough by itself.
+`wallets` is the wrong abstraction when the hard part is external money movement, regulation, or accounting-grade settlement:
+
+- **Banking infrastructure** — transfers to/from bank rails, cards, ACH, SEPA
+- **Regulated stored-value** — KYC, AML, licensing, custody requirements
+- **Escrow systems** — pending, available, reserved, delayed-release states
+- **FX conversion** — multi-currency conversion with exchange rates
+- **Full accounting** — charts of accounts, journal entries, financial reporting
+- **Blockchain/crypto** — consensus, custody, cryptographic guarantees
+
+### Skip both gems if:
+
+- You just need **one cached integer** (`users.balance += 1`) and don't care about history, audits, or transfers
+- Your "balance" is just a counter for display purposes
+
+**Rule of thumb:**
+- "How do I track balances and transfers inside my app?" → `wallets`
+- "How do I sell credits for API/SaaS operations?" → `usage_credits`
+- "How do I build payments infrastructure?" → Neither (you need a banking partner)
 
 ## Is this production-ready?
 
@@ -343,6 +699,12 @@ What it does not do for you:
 - cryptographic consensus or custody guarantees
 
 So the right framing is: strong internal wallet/accounting primitive, not money infrastructure by itself.
+
+## TODO
+
+- First-class transfer reversal/refund API built on compensating ledger entries
+- Optional pending/held balance primitives for escrow-like flows
+- Multi-step transfer policies beyond `:preserve`, `:none`, and fixed `expires_at`
 
 ## Development
 

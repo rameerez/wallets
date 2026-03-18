@@ -11,6 +11,7 @@ module Wallets
     attr_accessor :allow_negative_balance
     attr_reader :default_asset, :additional_categories, :table_prefix
     attr_reader :low_balance_threshold
+    attr_reader :transfer_expiration_policy
 
     # =========================================
     # Lifecycle Callbacks
@@ -30,6 +31,7 @@ module Wallets
       @additional_categories = []
       @allow_negative_balance = false
       @low_balance_threshold = nil
+      @transfer_expiration_policy = :preserve
       # This prefix is used by the models at runtime and by the install
       # migration when it is executed for the first time.
       @table_prefix = "wallets_"
@@ -69,6 +71,15 @@ module Wallets
       raise ArgumentError, "Table prefix can't be blank" if value.blank?
 
       @table_prefix = value
+    end
+
+    def transfer_expiration_policy=(value)
+      normalized_value = value.to_s.strip.downcase.to_sym
+      allowed_values = %i[preserve none]
+
+      raise ArgumentError, "Transfer expiration policy must be one of: #{allowed_values.join(', ')}" unless allowed_values.include?(normalized_value)
+
+      @transfer_expiration_policy = normalized_value
     end
 
     def on_balance_credited(&block)
