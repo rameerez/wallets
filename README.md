@@ -5,7 +5,7 @@
 > [!TIP]
 > **🚀 Ship your next Rails app 10x faster!** I've built **[RailsFast](https://railsfast.com/?ref=wallets)**, a production-ready Rails boilerplate template that comes with everything you need to launch a software business in days, not weeks. Go [check it out](https://railsfast.com/?ref=wallets)!
 
-`wallets` gives any Rails model one or more money-like wallets backed by an append-only transaction ledger. You can use these wallets to store and transfer value in any "currency" (points inside your app, in-app currencies, etc.)
+`wallets` gives any Rails model money-like wallets backed by an append-only transaction ledger. You can use these wallets to store and transfer value in any "currency" (points inside your app, call minutes, in-game resources, in-app assets, etc.)
 
 ![wallets](wallets.webp)
 
