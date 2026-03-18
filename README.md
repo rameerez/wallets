@@ -5,95 +5,43 @@
 > [!TIP]
 > **🚀 Ship your next Rails app 10x faster!** I've built **[RailsFast](https://railsfast.com/?ref=wallets)**, a production-ready Rails boilerplate template that comes with everything you need to launch a software business in days, not weeks. Go [check it out](https://railsfast.com/?ref=wallets)!
 
-`wallets` gives any Rails model one or more app-managed wallets backed by an append-only transaction ledger.
+`wallets` gives any Rails model one or more money-like wallets backed by an append-only transaction ledger. You can use these wallets to store and transfer value in any "currency" (points inside your app, in-app currencies, etc.)
+
+![wallets](wallets.webp)
 
 Use it for:
 
-- **Telecom / data plans** — "This plan gives you 10 GB per month, transfer unused data to friends"
-- **Game resources** — Wood, stone, gems, gold, energy — any virtual economy
-- **Multi-currency balances** — EUR, USD, GBP wallets per user
-- **Marketplace balances** — Seller earnings, buyer credits, platform payouts
-- **Rewards & loyalty** — Cashback, points, store credit, referral bonuses
-- **Gig economy** — Driver earnings, rider credits, tip wallets
+- **Rewards & loyalty points**: Cashback, points, store credit, referral bonuses
+- **Marketplace balances**: Seller earnings, buyer credits, platform payouts
+- **Gig economy**: Driver earnings, rider credits, tip wallets
+- **Multi-currency balances**: EUR, USD, GBP wallets per user
+- **Game resources**: Wood, stone, gems, gold, energy; any virtual economy
+- **Telecom / SIM data plans**: "This plan gives you 10 GB per month, transfer unused data to friends"
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         wallets                                 │
-│                                                                 │
-│   The ledger core: balances, transactions, transfers, expiry    │
-│                                                                 │
-│   user.wallet(:gb).credit(10_240, expires_at: month_end)        │
-│   user.wallet(:gb).transfer_to(friend.wallet(:gb), 3_072)       │
-│   user.wallet(:gb).debit(512, category: :network_usage)         │
-│   user.wallet(:gb).balance  # => 6656                           │
-└─────────────────────────────────────────────────────────────────┘
-```
+At its core, `wallets` provides your users with: a wallet with balance, a log of transactions, expirable balances, and transfers between users.
 
-## wallets vs usage_credits — which gem do I need?
-
-Both gems handle balances, but they solve different problems:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      usage_credits                              │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │  Subscriptions, Credit Packs, Pay Integration, Fulfillment │  │
-│  │  Operations DSL, Pricing, Refunds, Webhook Handling        │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                            │                                    │
-│                            ▼                                    │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │                       wallets                              │  │
-│  │    Balance, Credit, Debit, Transfer, Expiration, FIFO,    │  │
-│  │    Audit Trail, Row-Level Locking, Multi-Asset            │  │
-│  └───────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-| Aspect | `wallets` | `usage_credits` |
-|--------|-----------|-----------------|
-| **Core job** | Store and move value | Sell and consume value |
-| **Balance model** | Multi-asset (`:gb`, `:eur`, `:gems`) | Single asset (credits) |
-| **Consumption** | Passive — balance depletes over time | Active — `spend_credits_on(:operation)` |
-| **Transfers** | Built-in between users | Not designed for this |
-| **Subscriptions** | You handle externally | Built-in with Stripe via `pay` |
-| **Operations DSL** | None | `operation :send_email { costs 1.credit }` |
-| **Best for** | B2C: games, telecom, rewards, marketplaces | B2B: SaaS, APIs, AI apps |
-
-### When to use `wallets` alone
-
-Use `wallets` directly when your product:
-- Needs **multiple asset types** — `user.wallet(:wood)`, `user.wallet(:gold)`, `user.wallet(:eur)`
-- Has **passive consumption** — balance depletes from usage over time (data, minutes, energy)
-- Needs **user-to-user transfers** — gifting, P2P payments, marketplace settlements
-- Manages its own subscription logic — or doesn't need subscriptions at all
-
-### When to use `usage_credits`
-
-Use `usage_credits` when your product:
-- Sells **credits for specific operations** — "Process image costs 10 credits"
-- Needs **Stripe subscriptions** with automatic credit fulfillment
-- Wants the **operations DSL** — `spend_credits_on(:generate_report)`
-- Is a **B2B/SaaS/API product** with usage-based pricing
-
-### When to use both together
-
-For products like a **SIM/telecom app**, you might use both:
+For example, imagine you're building a SIM card app with data plans. At the beginning of each month, you give your users expirable data and call minutes:
 
 ```ruby
-# usage_credits handles ACQUISITION (how users get balance)
-subscription_plan :basic_data do
-  stripe_price "price_xyz"
-  gives 10_000.credits.every(:month)  # 10 GB in MB
-end
+user.wallet(:mb).credit(10_240, expires_at: month_end)   # 10 GB in MB
+user.wallet(:minutes).credit(500, expires_at: month_end) # 500 call minutes
+```
 
-# wallet-level movement is still available underneath usage_credits
-user.credit_wallet.transfer_to(friend.credit_wallet, 3_000)  # Gift 3 GB
-user.credit_wallet.balance  # => 7000 MB remaining
+Users can transfer their unused balance to friends:
+
+```ruby
+user.wallet(:mb).transfer_to(friend.wallet(:mb), 3_072)  # Send 3 GB
+```
+
+And balances decrease as they're consumed:
+
+```ruby
+user.wallet(:mb).debit(512, category: :network_usage)
+user.wallet(:mb).balance  # => 6656 MB remaining
 ```
 
 > [!TIP]
-> `usage_credits` 1.0 uses `wallets` as its ledger core. If you only need `usage_credits`, you get `wallets` for free underneath. Wallet-level methods like `user.credit_wallet.transfer_to(...)` are still available there, but the transfer DX intentionally lives at the wallet layer rather than the credits DSL.
+> If you want to implement usage credits in your app, use the [`usage_credits`](https://github.com/rameerez/usage_credits) gem! It uses `wallets` under the hood, and on top provides very handy DX ergonomics for recurring credits fulfillment, credit pack purchases, `pay` integration for charging users for credits, etc. `wallets` sits at the core of the `usage_credits` gem. It's meant to handle a generalized version of any digital in-app currency, not just credits. If you don't know whether you should use the `wallets` gem or the `usage_credits` gem, check out the [`wallets` vs `usage_credits`](#wallets-vs-usage_credits--which-gem-do-i-need) section below.
 
 ## Why this gem
 
@@ -102,7 +50,7 @@ user.credit_wallet.balance  # => 7000 MB remaining
 | Feature | What it does |
 |---------|--------------|
 | **Multi-asset** | One wallet per asset: `user.wallet(:usd)`, `user.wallet(:gems)` |
-| **Append-only ledger** | Every balance change is a transaction — no edits, only new entries |
+| **Append-only ledger** | Every balance change is a transaction: no edits, only new entries |
 | **FIFO allocation** | Debits consume oldest credits first (important for expiring balances) |
 | **Linked transfers** | Both sides of a transfer are recorded and queryable |
 | **Row-level locking** | Prevents race conditions and double-spending |
@@ -327,6 +275,72 @@ Useful fields on `ctx` include:
 - `ctx.transaction`
 - `ctx.category`
 - `ctx.metadata`
+
+## wallets vs usage_credits — which gem do I need?
+
+Both gems handle balances, but they solve different problems:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      usage_credits                              │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Subscriptions, Credit Packs, Pay Intgration, Fulfillment │  │
+│  │  Operations DSL, Pricing, Refunds, Webhook Handling       │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                            │                                    │
+│                            ▼                                    │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                       wallets                             │  │
+│  │    Balance, Credit, Debit, Transfer, Expiration, FIFO,    │  │
+│  │    Audit Trail, Row-Level Locking, Multi-Asset            │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+| Aspect | `wallets` | `usage_credits` |
+|--------|-----------|-----------------|
+| **Core job** | Store and move value | Sell and consume value |
+| **Balance model** | Multi-asset (`:gb`, `:eur`, `:gems`) | Single asset (credits) |
+| **Consumption** | Passive — balance depletes over time | Active — `spend_credits_on(:operation)` |
+| **Transfers** | Built-in between users | Not designed for this |
+| **Subscriptions** | You handle externally | Built-in with Stripe via `pay` |
+| **Operations DSL** | None | `operation :send_email { costs 1.credit }` |
+| **Best for** | B2C: games, telecom, rewards, marketplaces | B2B: SaaS, APIs, AI apps |
+
+### When to use `wallets` alone
+
+Use `wallets` directly when your product:
+- Needs **multiple asset types** — `user.wallet(:wood)`, `user.wallet(:gold)`, `user.wallet(:eur)`
+- Has **passive consumption** — balance depletes from usage over time (data, minutes, energy)
+- Needs **user-to-user transfers** — gifting, P2P payments, marketplace settlements
+- Manages its own subscription logic — or doesn't need subscriptions at all
+
+### When to use `usage_credits`
+
+Use `usage_credits` when your product:
+- Sells **credits for specific operations** — "Process image costs 10 credits"
+- Needs **Stripe subscriptions** with automatic credit fulfillment
+- Wants the **operations DSL** — `spend_credits_on(:generate_report)`
+- Is a **B2B/SaaS/API product** with usage-based pricing
+
+### When to use both together
+
+For products like a **SIM/telecom app**, you might use both:
+
+```ruby
+# usage_credits handles ACQUISITION (how users get balance)
+subscription_plan :basic_data do
+  stripe_price "price_xyz"
+  gives 10_000.credits.every(:month)  # 10 GB in MB
+end
+
+# wallet-level movement is still available underneath usage_credits
+user.credit_wallet.transfer_to(friend.credit_wallet, 3_000)  # Gift 3 GB
+user.credit_wallet.balance  # => 7000 MB remaining
+```
+
+> [!TIP]
+> `usage_credits` 1.0 uses `wallets` as its ledger core. If you only need `usage_credits`, you get `wallets` for free underneath. Wallet-level methods like `user.credit_wallet.transfer_to(...)` are still available there, but the transfer DX intentionally lives at the wallet layer rather than the credits DSL.
 
 ## Real-world examples
 
