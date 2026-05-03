@@ -245,6 +245,31 @@ Transfers require both wallets to use the same asset and the same wallet class. 
 > sender.transfer_to(receiver, 100, expiration_policy: :fixed, expires_at: 30.days.from_now)
 > ```
 
+### Negative balances and overdraft
+
+By default `wallets` rejects any debit or transfer that would push a wallet below zero. Some apps (ride-fare apps with rewards, family wallets with shared spend, telecom plans with bridging credit, etc.) want to allow a small overdraft so the user experience doesn't hard-stop on a low balance.
+
+Flip one flag and it applies consistently to direct `wallet.debit` and to `wallet.transfer_to`:
+
+```ruby
+Wallets.configure do |config|
+  config.allow_negative_balance = true
+end
+
+passenger.wallet(:eur).balance       # => 100  (1€)
+passenger.wallet(:eur).transfer_to(driver.wallet(:eur), 300, category: :ride_fare)
+passenger.wallet(:eur).reload.balance # => -200 (-2€)
+driver.wallet(:eur).reload.balance    # => 300  (3€)
+```
+
+A few things to know:
+
+- **Apps own the floor.** The flag is binary — it doesn't cap how negative a wallet can go. If you want a "5€ convenience overdraft", enforce that in your domain code before calling `transfer_to` (e.g. a `WalletPolicy.can_afford?(wallet:, amount:)` service that checks `wallet.balance + MAX_OVERDRAFT >= amount`).
+- **`has_enough_balance?` stays strict.** It answers "does this wallet have enough on hand right now?" — overdraft is a deliberate choice the caller makes by attempting the debit/transfer, not by querying. So `wallet.has_enough_balance?(amount)` returns `false` even when the gem would happily complete an overdraft.
+- **`:preserve` expiration falls back to `:none` when a transfer goes negative.** With `allow_negative_balance = true` and the default `:preserve` policy, transfers that exceed the source's positive buckets can't honestly "preserve" an expiration on the deficit portion (there is no source bucket). The transfer's `expiration_policy` is automatically downgraded to `:none` for that transfer; the receiver gets a single evergreen credit. Explicit `:fixed` (with `expires_at:`) and `:none` are honored as-is.
+- **System-initiated reversals.** Refunds and payout reversals via `transfer_to` will also go through, even if the recipient's wallet ends up below zero. That's correct: the ledger has to settle, and a negative wallet records a real debt instead of a silent failure. Apps that want to *block* user-initiated overdrafts but *allow* system reversals should keep the floor check in their service layer, not toggle the flag mid-request.
+- **`:insufficient_balance` callback.** Fires only when a debit or transfer is actually rejected (i.e. flag off or your service-layer floor refused). Successful overdraft transfers do not fire it.
+
 ### Expiring balances
 
 Credits can expire:

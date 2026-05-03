@@ -243,9 +243,48 @@ module Wallets
         lock_wallet_pair!(other_wallet)
 
         previous_balance = balance
-        if amount > previous_balance
+
+        # Insufficient-balance gate.
+        #
+        # `allow_negative_balance` is the single source of truth for whether
+        # the gem permits a wallet to drop below zero. Direct `wallet.debit`
+        # has always honored it via `apply_debit`; transfers must too, or
+        # the flag is half-applied and surprising (debits go through, the
+        # canonical transfer primitive doesn't).
+        #
+        # When the flag is OFF, this is the only chance to refuse cleanly:
+        # we want to dispatch `:insufficient_balance` for the observability
+        # callback, then raise BEFORE creating the Transfer row. (The later
+        # `apply_debit` call would also catch this, but only after a
+        # pointless Transfer row was created.)
+        #
+        # When the flag is ON, we let the transfer through. `apply_debit`
+        # below will allocate as many positive buckets as exist; the
+        # remaining shortfall lands as an unbacked negative transaction the
+        # wallet's `balance` accounting accommodates via
+        # `unbacked_negative_balance`.
+        if amount > previous_balance && !allow_negative_balance?
           dispatch_insufficient_balance!(amount, previous_balance, metadata)
           raise InsufficientBalance, "Insufficient balance (#{previous_balance} < #{amount})"
+        end
+
+        # When a transfer dips below zero we can't faithfully apply the
+        # `:preserve` expiration policy: there are no positive source
+        # buckets to inherit expirations from for the deficit portion.
+        # `build_preserved_transfer_inbound_credit_specs` would refuse with
+        # `InvalidTransfer` on the count mismatch, defeating the very
+        # callers who opted into negative balances. The only honest
+        # fallback is to collapse the inbound side to a single evergreen
+        # credit (`:none`) — value created without a source bucket has no
+        # source expiration to preserve.
+        #
+        # Callers who care about a specific expiration on the inbound side
+        # should pass `expiration_policy: :fixed, expires_at: …`. Those are
+        # honored unchanged because they don't depend on source-bucket
+        # walking. Same for an explicit `:none`.
+        if resolved_policy == "preserve" && amount > previous_balance
+          resolved_policy = "none"
+          inbound_expires_at = nil
         end
 
         transfer = transfer_class.create!(
