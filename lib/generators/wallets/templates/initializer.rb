@@ -17,6 +17,14 @@ Wallets.configure do |config|
   # config.table_prefix = "wallets_"
 
   # Set to true only if your domain explicitly supports debt or overdrafts.
+  # Applies consistently across `wallet.debit` and `wallet.transfer_to` — a
+  # debit or a transfer can drive the source wallet below zero. Cap how
+  # negative a wallet can go in your own service layer (the flag is binary).
+  #
+  # Heads up: this is meant to be a stable config decision, not a runtime
+  # toggle. Flipping it OFF while wallets are negative leaves those wallets
+  # un-saveable until you flip it back on. Drain or settle negative wallets
+  # before disabling.
   #
   # config.allow_negative_balance = false
 
@@ -49,7 +57,8 @@ Wallets.configure do |config|
   #   on_balance_debited       - After value is deducted from a wallet
   #   on_transfer_completed    - After a transfer between wallets succeeds
   #   on_low_balance_reached   - When balance drops below the threshold
-  #   on_balance_depleted      - When balance reaches exactly zero
+  #   on_balance_depleted      - When a debit drives balance from positive
+  #                              to zero or below (one-shot per crossing)
   #   on_insufficient_balance  - When a debit or transfer is rejected
   #
   # Context object properties (available depending on event):

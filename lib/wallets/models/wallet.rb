@@ -621,11 +621,21 @@ module Wallets
         )
       end
 
-      if previous_balance.positive? && balance.zero?
+      # `:balance_depleted` fires when the wallet crosses from a positive
+      # balance to ZERO OR LOWER on this debit. We use `<= 0` rather than
+      # `== 0` so the callback still fires when `allow_negative_balance` is
+      # true and a single debit takes the wallet from e.g. +100 to -50
+      # (skipping exact zero). With negatives disabled, `balance` cannot
+      # go below zero, so `<= 0` collapses to `== 0` and the original
+      # "exactly zero" semantic is preserved for default-config users.
+      # Either way the callback is one-shot per crossing — going from -50
+      # to -80 doesn't re-fire because `previous_balance` was already
+      # non-positive.
+      if previous_balance.positive? && !balance.positive?
         dispatch_callback(:depleted,
           wallet: self,
           previous_balance: previous_balance,
-          new_balance: 0
+          new_balance: balance
         )
       end
     end
