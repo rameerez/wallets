@@ -153,18 +153,262 @@ class Wallets::TransferTest < ActiveSupport::TestCase
     assert_includes error.message, "expiration policy"
   end
 
-  test "rejects transfers that exceed available balance even when negatives are enabled" do
-    original_setting = Wallets.configuration.allow_negative_balance
-    Wallets.configuration.allow_negative_balance = true
-
+  test "rejects transfers that exceed available balance when negatives are disabled" do
     sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 10)
     recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
 
     assert_raises(Wallets::InsufficientBalance) do
       sender.transfer_to(recipient, 25, category: :gift)
     end
-  ensure
-    Wallets.configuration.allow_negative_balance = original_setting
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # `allow_negative_balance` parity for transfers
+  # ───────────────────────────────────────────────────────────────────────────
+  #
+  # `wallet.debit` has always honored `Wallets.configuration.allow_negative_balance`
+  # via `apply_debit`, but `wallet.transfer_to` had its own pre-check that
+  # ALWAYS rejected transfers exceeding the source balance — the flag only
+  # half-applied. Apps that flipped the flag on for a "convenience overdraft"
+  # (e.g. ride-fare apps where passengers may briefly go negative until
+  # rewards land) found their direct debits worked, but the canonical
+  # transfer primitive — used to move value between users — silently still
+  # required positive balance.
+  #
+  # Tests below cement the new contract: with `allow_negative_balance = true`,
+  # transfers behave like debits — they go through, drive the source negative
+  # (with the inbound credit forced to "none" expiration since the source has
+  # no positive buckets to "preserve" from), and otherwise leave the rest of
+  # the transfer flow untouched.
+
+  test "transfers drive the source wallet negative when allow_negative_balance is enabled" do
+    Wallets.configuration.allow_negative_balance = true
+
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 10)
+    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+
+    transfer = sender.transfer_to(recipient, 25, category: :peer_payment)
+
+    assert transfer.persisted?
+    assert_equal 25, transfer.amount
+    assert_equal(-15, sender.reload.balance, "source wallet went negative within the gem-level overdraft")
+    assert_equal 25, recipient.reload.balance
+    assert_equal sender.id, transfer.from_wallet_id
+    assert_equal recipient.id, transfer.to_wallet_id
+  end
+
+  test "transfers from a wallet with zero balance succeed when allow_negative_balance is enabled" do
+    Wallets.configuration.allow_negative_balance = true
+
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 0)
+    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+
+    transfer = sender.transfer_to(recipient, 100, category: :peer_payment)
+
+    assert transfer.persisted?
+    assert_equal(-100, sender.reload.balance)
+    assert_equal 100, recipient.reload.balance
+  end
+
+  test "transfers from an already-negative wallet keep going further negative when allow_negative_balance is enabled" do
+    Wallets.configuration.allow_negative_balance = true
+
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 0)
+    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+    sender.debit(50, category: :purchase)
+    assert_equal(-50, sender.reload.balance)
+
+    transfer = sender.transfer_to(recipient, 30, category: :peer_payment)
+
+    assert transfer.persisted?
+    assert_equal(-80, sender.reload.balance)
+    assert_equal 30, recipient.reload.balance
+  end
+
+  test "preserve policy falls back to none when the transfer drives the source below zero" do
+    # With "preserve", the gem normally allocates inbound credits across the
+    # same expiration buckets the outbound debit consumed. When the source
+    # has no positive buckets to consume from (or the transfer exceeds them),
+    # there is nothing to preserve — falling back to "none" produces an
+    # evergreen inbound credit on the receiver, which is the only honest
+    # representation of "value created without a source bucket". Without
+    # this fallback, `build_preserved_transfer_inbound_credit_specs` would
+    # raise `InvalidTransfer` on the count mismatch.
+    Wallets.configuration.allow_negative_balance = true
+
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 0)
+    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+
+    transfer = sender.transfer_to(recipient, 40, category: :peer_payment)
+    inbound = transfer.inbound_transactions.sole
+
+    assert_equal "none", transfer.expiration_policy, "falls back to none when no positive buckets exist"
+    assert_equal 40, inbound.amount
+    assert_nil inbound.expires_at
+  end
+
+  test "preserve fallback hits when partial overdraft mixes positive buckets with new debt" do
+    # Sender has a 30-credit positive bucket; transfers 100. The transfer
+    # consumes the 30 (preserve would inherit its expiration) plus needs 70
+    # more from thin air. There is no honest single expiration to assign
+    # to that 70, so we collapse the inbound side to a single "none" credit
+    # for the full amount.
+    Wallets.configuration.allow_negative_balance = true
+
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 0)
+    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+    sender.credit(30, category: :top_up, expires_at: 60.days.from_now)
+
+    transfer = sender.transfer_to(recipient, 100, category: :peer_payment)
+    inbound = transfer.inbound_transactions.sole
+
+    assert_equal "none", transfer.expiration_policy
+    assert_equal 100, inbound.amount
+    assert_nil inbound.expires_at
+    assert_equal(-70, sender.reload.balance)
+    assert_equal 100, recipient.reload.balance
+  end
+
+  test "preserve policy still preserves expiration buckets when the transfer fits within positive balance" do
+    # Sanity check — the negative-balance fallback must not regress the
+    # default behavior for transfers that fit normally inside the source's
+    # positive buckets. Same flag on, but the source has enough; preserve
+    # works as before.
+    Wallets.configuration.allow_negative_balance = true
+
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 0)
+    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+    expiration = 90.days.from_now
+    sender.credit(200, category: :top_up, expires_at: expiration)
+
+    transfer = sender.transfer_to(recipient, 75, category: :peer_payment)
+    inbound = transfer.inbound_transactions.sole
+
+    assert_equal "preserve", transfer.expiration_policy
+    assert_equal 75, inbound.amount
+    assert_equal expiration.to_i, inbound.expires_at.to_i
+  end
+
+  test "fixed expiration policy is honored when transfer drives the source negative" do
+    # If the caller chose "fixed" with an explicit expires_at, the inbound
+    # credit takes that expiration regardless of source bucket coverage —
+    # the user explicitly opted into a single inbound expiration, no need
+    # for the preserve→none fallback.
+    Wallets.configuration.allow_negative_balance = true
+
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 0)
+    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+    expiration = 14.days.from_now
+
+    transfer = sender.transfer_to(recipient, 50, category: :peer_payment, expiration_policy: :fixed, expires_at: expiration)
+    inbound = transfer.inbound_transactions.sole
+
+    assert_equal "fixed", transfer.expiration_policy
+    assert_equal 50, inbound.amount
+    assert_equal expiration.to_i, inbound.expires_at.to_i
+    assert_equal(-50, sender.reload.balance)
+  end
+
+  test "explicit none policy is honored when transfer drives the source negative" do
+    Wallets.configuration.allow_negative_balance = true
+
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 0)
+    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+
+    transfer = sender.transfer_to(recipient, 50, category: :peer_payment, expiration_policy: :none)
+    inbound = transfer.inbound_transactions.sole
+
+    assert_equal "none", transfer.expiration_policy
+    assert_nil inbound.expires_at
+    assert_equal(-50, sender.reload.balance)
+  end
+
+  test "transfer that drives the source negative dispatches the transfer_completed callback" do
+    Wallets.configuration.allow_negative_balance = true
+    completed = []
+    Wallets.configuration.on_transfer_completed { |ctx| completed << ctx }
+
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 0)
+    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+
+    transfer = sender.transfer_to(recipient, 25, category: :peer_payment)
+
+    assert_equal 1, completed.size
+    assert_equal transfer.id, completed.first.transfer.id
+    assert_equal 25, completed.first.amount
+  end
+
+  test "insufficient_balance callback does NOT fire on a successful negative-going transfer" do
+    # The pre-check used to dispatch :insufficient and then raise. Now that
+    # negative balances are allowed end-to-end, neither side-effect should
+    # happen for a transfer that goes through. This guards against a
+    # regression where the pre-check was kept but the raise was conditioned
+    # — the callback would still fire for callers who installed
+    # `on_insufficient_balance` for top-up nudge UX.
+    Wallets.configuration.allow_negative_balance = true
+    insufficient = []
+    Wallets.configuration.on_insufficient_balance { |ctx| insufficient << ctx }
+
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 0)
+    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+
+    sender.transfer_to(recipient, 25, category: :peer_payment)
+
+    assert_empty insufficient, "successful negative-going transfer must not fire insufficient_balance"
+  end
+
+  test "insufficient_balance callback still fires when negatives are disabled and the transfer is rejected" do
+    insufficient = []
+    Wallets.configuration.on_insufficient_balance { |ctx| insufficient << ctx }
+
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 10)
+    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+
+    assert_raises(Wallets::InsufficientBalance) do
+      sender.transfer_to(recipient, 25, category: :peer_payment)
+    end
+
+    assert_equal 1, insufficient.size, "with the flag off the rejection path keeps its observability"
+    assert_equal 25, insufficient.first.metadata[:required]
+    assert_equal 10, insufficient.first.metadata[:available]
+  end
+
+  test "has_enough_balance? still reflects strict balance even when allow_negative_balance is true" do
+    # `has_enough_balance?` is the opt-in pre-flight check apps use to decide
+    # whether to attempt a transfer / debit at all. It intentionally keeps
+    # strict semantics — overdraft is a deliberate choice the caller makes
+    # by attempting the transfer; the predicate just answers "do they have
+    # enough on hand?".
+    Wallets.configuration.allow_negative_balance = true
+
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 10)
+
+    refute sender.has_enough_balance?(25)
+    assert sender.has_enough_balance?(10)
+  end
+
+  test "concurrent overdraft transfers serialize through the wallet pair lock" do
+    # `lock_wallet_pair!` already serialized concurrent transfers under the
+    # positive-balance contract. With overdraft the lock matters more, not
+    # less — two threads scanning a QR shouldn't double-debit a passenger
+    # whose remaining headroom only covers one transfer. Verify the lock
+    # is still acquired before the balance read used by the transfer.
+    Wallets.configuration.allow_negative_balance = true
+    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 0)
+    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+
+    lock_calls = 0
+    sender.singleton_class.send(:define_method, :lock_wallet_pair!) do |other|
+      lock_calls += 1
+      first, second = [self, other].sort_by(&:id)
+      first.lock!
+      second.lock! unless first.id == second.id
+    end
+
+    sender.transfer_to(recipient, 25, category: :peer_payment)
+
+    assert_equal 1, lock_calls
+    assert_equal(-25, sender.reload.balance)
   end
 
   test "rejects transfers across different assets" do
