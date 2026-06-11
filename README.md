@@ -799,8 +799,49 @@ What it does not do for you:
 
 So the right framing is: strong internal wallet/accounting primitive, not money infrastructure by itself.
 
+## Embedding `wallets` in your own gem
+
+`wallets` is built to be embeddable: other gems can reuse the ledger core (FIFO allocation, locking, transfers, callbacks) on top of their **own** tables, config, and event names. This is exactly how [`usage_credits`](https://github.com/rameerez/usage_credits) works — its `UsageCredits::Wallet` is a `Wallets::Wallet` subclass living in `usage_credits_*` tables.
+
+These class-level hooks are a supported, stable contract (covered by tests — breaking them is a breaking change for downstream gems):
+
+```ruby
+class MyGem::Wallet < Wallets::Wallet
+  self.embedded_table_name = "my_gem_wallets"            # your table, not wallets_wallets
+  self.config_provider = -> { MyGem.configuration }      # your config object
+  self.callbacks_module = MyGem::Callbacks               # your callback dispatcher
+  self.transaction_class_name = "MyGem::Transaction"     # your subclasses
+  self.allocation_class_name = "MyGem::Allocation"
+  self.transfer_class_name = "MyGem::Transfer"
+
+  # Rename (or silence, with nil) core events for your domain:
+  self.callback_event_map = {
+    credited: :coins_added,
+    debited: :coins_spent,
+    insufficient: :not_enough_coins,
+    low_balance: :low_balance,
+    depleted: :out_of_coins,
+    transfer_completed: nil  # nil = don't dispatch this event
+  }.freeze
+
+  class << self
+    private
+
+    # Customize the ledger entry recorded for `create_for_owner!(initial_balance:)`
+    def initial_balance_credit_attributes
+      { category: :starting_coins, metadata: { reason: "initial_balance" } }
+    end
+  end
+end
+```
+
+Your `Transaction`, `Allocation`, and `Transfer` subclasses set `embedded_table_name` (and `config_provider` / `transaction_class_name` where relevant) the same way.
+
+One current limitation to be aware of: the core models declare their associations against the `Wallets::*` class names, so your subclasses should **re-declare associations** with your own classes (`belongs_to :wallet, class_name: "MyGem::Wallet"`, etc.) so that records load as your subclasses rather than the core ones. See `usage_credits`' models for the canonical embedding pattern.
+
 ## TODO
 
+- Dynamic association class resolution for embedded subclasses (so embedders don't need to re-declare associations)
 - First-class transfer reversal/refund API built on compensating ledger entries
 - Optional pending/held balance primitives for escrow-like flows
 - Multi-step transfer policies beyond `:preserve`, `:none`, and fixed `expires_at`
