@@ -12,12 +12,15 @@ module Wallets
   # table names, and related model classes without affecting the base Wallets::*
   # behavior in the same application.
   class Wallet < ApplicationRecord
+    include Wallets::Embeddable
+    include Wallets::HasMetadata
+
+    self.table_suffix = "wallets"
+
     # =========================================
     # Embeddability Hooks
     # =========================================
 
-    class_attribute :embedded_table_name, default: nil
-    class_attribute :config_provider, default: -> { Wallets.configuration }
     class_attribute :callbacks_module, default: Wallets::Callbacks
     class_attribute :transaction_class_name, default: "Wallets::Transaction"
     class_attribute :allocation_class_name, default: "Wallets::Allocation"
@@ -30,19 +33,6 @@ module Wallets
       depleted: :balance_depleted,
       transfer_completed: :transfer_completed
     }.freeze
-
-    # =========================================
-    # Table Name Resolution
-    # =========================================
-
-    def self.table_name
-      embedded_table_name || "#{resolved_config.table_prefix}wallets"
-    end
-
-    def self.resolved_config
-      value = config_provider
-      value.respond_to?(:call) ? value.call : value
-    end
 
     def self.transaction_class
       transaction_class_name.constantize
@@ -60,7 +50,10 @@ module Wallets
     # Associations & Validations
     # =========================================
 
-    belongs_to :owner, polymorphic: true
+    # `optional: false` is explicit everywhere because the gem's models load
+    # before Rails applies `belongs_to_required_by_default`, so the host app's
+    # default never reaches these associations.
+    belongs_to :owner, polymorphic: true, optional: false
 
     has_many :transactions, class_name: "Wallets::Transaction", dependent: :destroy
     has_many :outgoing_transfers,
@@ -79,7 +72,6 @@ module Wallets
     validates :balance, numericality: { greater_than_or_equal_to: 0 }, unless: :allow_negative_balance?
 
     before_validation :normalize_asset_code!
-    before_save :sync_metadata_cache
 
     # =========================================
     # Class Methods
@@ -89,33 +81,35 @@ module Wallets
       def create_for_owner!(owner:, asset_code:, initial_balance: 0, metadata: {})
         initial_balance = normalize_initial_balance(initial_balance)
         asset_code = normalize_asset_code(asset_code)
-        metadata = metadata.respond_to?(:to_h) ? metadata.to_h : {}
 
         existing_wallet = find_by(owner: owner, asset_code: asset_code)
         return existing_wallet if existing_wallet.present?
 
-        transaction do
-          wallet = create!(
-            owner: owner,
-            asset_code: asset_code,
-            balance: 0,
-            metadata: metadata
-          )
+        # `requires_new` gives us a savepoint when we are already inside a
+        # caller's transaction (e.g. `after_create` wallet auto-creation), and
+        # the rescue lives OUTSIDE the transaction block. Both matter on
+        # PostgreSQL: a concurrent duplicate INSERT aborts the transaction it
+        # ran in, so recovering with a SELECT only works after that
+        # transaction (or savepoint) has rolled back.
+        begin
+          transaction(requires_new: true) do
+            wallet = create!(
+              owner: owner,
+              asset_code: asset_code,
+              balance: 0,
+              metadata: metadata
+            )
 
-          if initial_balance.positive?
-            wallet.credit(initial_balance, **initial_balance_credit_attributes)
-          end
+            wallet.credit(initial_balance, **initial_balance_credit_attributes) if initial_balance.positive?
 
-          wallet
-        rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid => error
-          wallet = find_by(owner: owner, asset_code: asset_code)
-          raise error if wallet.nil?
-
-          if record_conflict_due_to_existing_wallet?(error)
             wallet
-          else
-            raise error
           end
+        rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid => error
+          raise error unless record_conflict_due_to_existing_wallet?(error)
+
+          # Two callers raced to create the same wallet; the loser gracefully
+          # returns the winner's row.
+          find_by(owner: owner, asset_code: asset_code) || raise(error)
         end
       end
 
@@ -130,7 +124,9 @@ module Wallets
 
       def normalize_initial_balance(value)
         return 0 if value.nil?
-        raise ArgumentError, "Initial balance must be a whole number" unless value == value.to_i
+
+        whole = (value == value.to_i rescue false)
+        raise ArgumentError, "Initial balance must be a whole number" unless whole
 
         value = value.to_i
         raise ArgumentError, "Initial balance cannot be negative" if value.negative?
@@ -139,33 +135,14 @@ module Wallets
       end
 
       def normalize_asset_code(value)
-        value.to_s.strip.downcase.presence || raise(ArgumentError, "Asset code is required")
+        Wallets.normalize_asset_code(value).presence || raise(ArgumentError, "Asset code is required")
       end
 
       def record_conflict_due_to_existing_wallet?(error)
         return true if error.is_a?(ActiveRecord::RecordNotUnique)
-        return false unless error.is_a?(ActiveRecord::RecordInvalid)
 
         error.record.errors.of_kind?(:asset_code, :taken)
       end
-    end
-
-    # =========================================
-    # Metadata Handling
-    # =========================================
-
-    def metadata
-      @indifferent_metadata ||= ActiveSupport::HashWithIndifferentAccess.new(super || {})
-    end
-
-    def metadata=(hash)
-      @indifferent_metadata = nil
-      super(hash.respond_to?(:to_h) ? hash.to_h : {})
-    end
-
-    def reload(*)
-      @indifferent_metadata = nil
-      super
     end
 
     # =========================================
@@ -181,7 +158,7 @@ module Wallets
     end
 
     def history
-      transactions.order(created_at: :asc)
+      transactions.order(created_at: :asc, id: :asc)
     end
 
     def has_enough_balance?(amount)
@@ -230,6 +207,7 @@ module Wallets
 
     def transfer_to(other_wallet, amount, category: :transfer, metadata: {}, expiration_policy: nil, expires_at: nil)
       raise InvalidTransfer, "Target wallet is required" if other_wallet.nil?
+      raise InvalidTransfer, "Source wallet must be persisted" unless persisted?
       raise InvalidTransfer, "Target wallet must be persisted" unless other_wallet.persisted?
       raise InvalidTransfer, "Cannot transfer to the same wallet" if other_wallet.id == id
       raise InvalidTransfer, "Wallet assets must match" unless asset_code == other_wallet.asset_code
@@ -239,7 +217,7 @@ module Wallets
       metadata = normalize_metadata(metadata)
       resolved_policy, inbound_expires_at = resolve_transfer_expiration!(expiration_policy, expires_at)
 
-      ActiveRecord::Base.transaction do
+      self.class.transaction do
         lock_wallet_pair!(other_wallet)
 
         previous_balance = balance
@@ -466,9 +444,12 @@ module Wallets
     def allocate_debit!(spend_transaction, amount)
       remaining_to_allocate = amount
 
+      # Soonest-expiring buckets are consumed first so expirable value never
+      # sits unused behind evergreen value; ties (including all-evergreen
+      # wallets) fall back to oldest-first.
       positive_transactions = transactions
-        .where("amount > 0")
-        .where("expires_at IS NULL OR expires_at > ?", Time.current)
+        .credits
+        .not_expired
         .order(Arel.sql("COALESCE(expires_at, '9999-12-31 23:59:59'), id ASC"))
         .lock("FOR UPDATE")
         .to_a
@@ -573,8 +554,8 @@ module Wallets
       alloc_table = allocation_class.table_name
 
       transactions
-        .where("amount > 0")
-        .where("expires_at IS NULL OR expires_at > ?", Time.current)
+        .credits
+        .not_expired
         .sum("amount - (SELECT COALESCE(SUM(amount), 0) FROM #{alloc_table} WHERE source_transaction_id = #{txn_table}.id)")
         .to_i
     end
@@ -584,7 +565,7 @@ module Wallets
       alloc_table = allocation_class.table_name
 
       transactions
-        .where("amount < 0")
+        .debits
         .sum("ABS(amount) - (SELECT COALESCE(SUM(amount), 0) FROM #{alloc_table} WHERE transaction_id = #{txn_table}.id)")
         .to_i
     end
@@ -665,12 +646,21 @@ module Wallets
     def validate_expiration!(expires_at)
       return if expires_at.nil?
       raise ArgumentError, "Expiration date must respond to to_datetime" unless expires_at.respond_to?(:to_datetime)
-      raise ArgumentError, "Expiration date must be in the future" if expires_at <= Time.current
+
+      expiration = begin
+        expires_at.to_datetime
+      rescue StandardError
+        raise ArgumentError, "Expiration date must be a valid date or time"
+      end
+
+      raise ArgumentError, "Expiration date must be in the future" if expiration <= Time.current
     end
 
     def normalize_positive_amount!(amount)
       raise ArgumentError, "Amount is required" if amount.nil?
-      raise ArgumentError, "Amount must be a whole number" unless amount == amount.to_i
+
+      whole = (amount == amount.to_i rescue false)
+      raise ArgumentError, "Amount must be a whole number" unless whole
 
       amount = amount.to_i
       raise ArgumentError, "Amount must be positive" unless amount.positive?
@@ -689,15 +679,7 @@ module Wallets
     end
 
     def normalize_asset_code!
-      self.asset_code = asset_code.to_s.strip.downcase.presence
-    end
-
-    def sync_metadata_cache
-      if @indifferent_metadata
-        write_attribute(:metadata, @indifferent_metadata.to_h)
-      elsif read_attribute(:metadata).nil?
-        write_attribute(:metadata, {})
-      end
+      self.asset_code = Wallets.normalize_asset_code(asset_code).presence
     end
   end
 end

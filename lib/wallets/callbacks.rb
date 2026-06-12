@@ -7,7 +7,10 @@ module Wallets
     module_function
 
     def dispatch(event, **context_data)
-      callback = Wallets.configuration.public_send(:"on_#{event}_callback")
+      reader = :"on_#{event}_callback"
+      return unless Wallets.configuration.respond_to?(reader)
+
+      callback = Wallets.configuration.public_send(reader)
       return unless callback.is_a?(Proc)
 
       context = CallbackContext.new(event: event, **context_data)
@@ -29,25 +32,27 @@ module Wallets
     end
 
     def log_error(message)
-      if defined?(Rails) && Rails.respond_to?(:logger) && Rails.logger
-        Rails.logger.error(message)
+      if rails_logger
+        rails_logger.error(message)
       else
         warn message
       end
     end
 
     def log_warn(message)
-      if defined?(Rails) && Rails.respond_to?(:logger) && Rails.logger
-        Rails.logger.warn(message)
+      if rails_logger
+        rails_logger.warn(message)
       else
         warn message
       end
     end
 
     def log_debug(message)
-      if defined?(Rails) && Rails.respond_to?(:logger) && Rails.logger&.debug?
-        Rails.logger.debug(message)
-      end
+      rails_logger.debug(message) if rails_logger&.debug?
+    end
+
+    def rails_logger
+      Rails.logger if defined?(Rails) && Rails.respond_to?(:logger)
     end
   end
 end

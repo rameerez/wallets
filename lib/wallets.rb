@@ -32,14 +32,21 @@ module Wallets
     def reset!
       @configuration = nil
     end
+
+    # Single source of truth for asset code normalization:
+    # " EUR ", :EUR, and "eur" all name the same wallet.
+    def normalize_asset_code(value)
+      value.to_s.strip.downcase
+    end
   end
 end
 
+require "wallets/models/concerns/embeddable"
+require "wallets/models/concerns/has_metadata"
 require "wallets/models/concerns/has_wallets"
 require "wallets/models/wallet"
 require "wallets/models/transaction"
 require "wallets/models/allocation"
 require "wallets/models/transfer"
 
-require "wallets/engine" if defined?(Rails)
-require "wallets/railtie" if defined?(Rails)
+require "wallets/engine"

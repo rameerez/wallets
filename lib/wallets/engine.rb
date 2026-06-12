@@ -4,15 +4,11 @@ module Wallets
   class Engine < ::Rails::Engine
     isolate_namespace Wallets
 
-    # Load wallet models early so host apps can reference them during boot.
-    config.autoload_paths << File.expand_path("models", __dir__)
-    config.autoload_paths << File.expand_path("models/concerns", __dir__)
-
-    initializer "wallets.autoload", before: :set_autoload_paths do |app|
-      app.config.autoload_paths << root.join("lib")
-      app.config.autoload_paths << root.join("lib/wallets/models")
-      app.config.autoload_paths << root.join("lib/wallets/models/concerns")
-    end
+    # All gem code is required eagerly by lib/wallets.rb, so nothing here is
+    # added to the host app's autoload paths. Registering lib/wallets/models
+    # with Zeitwerk would claim top-level constants like ::Wallet and
+    # ::Transaction and shadow (break) host apps that define models with
+    # those very common names.
 
     initializer "wallets.active_record" do
       ActiveSupport.on_load(:active_record) do

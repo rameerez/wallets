@@ -45,7 +45,7 @@ module Wallets
     end
 
     def default_asset=(value)
-      value = normalize_asset_code(value)
+      value = Wallets.normalize_asset_code(value)
       raise ArgumentError, "Default asset can't be blank" if value.blank?
 
       @default_asset = value.to_sym
@@ -107,10 +107,6 @@ module Wallets
     end
 
     private
-
-    def normalize_asset_code(value)
-      value.to_s.strip.downcase
-    end
 
     def normalize_category(value)
       value.to_s.strip

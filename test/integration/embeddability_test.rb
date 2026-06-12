@@ -211,7 +211,8 @@ class EmbeddabilityTest < ActiveSupport::TestCase
     has_many :transactions,
              class_name: "EmbeddabilityTest::EmbeddedTransaction",
              foreign_key: :transfer_id,
-             inverse_of: :transfer
+             inverse_of: :transfer,
+             dependent: :nullify
   end
 
   ensure_embedded_tables!
@@ -234,6 +235,46 @@ class EmbeddabilityTest < ActiveSupport::TestCase
   test "embedded classes use custom callback module" do
     assert_equal EmbeddedCallbacks, EmbeddedWallet.callbacks_module
     assert_equal Wallets::Callbacks, Wallets::Wallet.callbacks_module
+  end
+
+  test "embedded table names derive from config prefix and model suffix when not set explicitly" do
+    derived_wallet_class = Class.new(Wallets::Wallet) do
+      self.config_provider = -> { EmbeddabilityTest.embedded_config }
+    end
+    derived_transaction_class = Class.new(Wallets::Transaction) do
+      self.config_provider = -> { EmbeddabilityTest.embedded_config }
+    end
+
+    assert_equal "embedded_wallets", derived_wallet_class.table_name
+    assert_equal "embedded_transactions", derived_transaction_class.table_name
+  end
+
+  test "config_provider accepts a plain config object as well as a callable" do
+    config_instance = EmbeddedConfig.new
+    direct_config_class = Class.new(Wallets::Wallet)
+    direct_config_class.config_provider = config_instance
+
+    assert_same config_instance, direct_config_class.resolved_config
+    assert_equal "embedded_wallets", direct_config_class.table_name
+  end
+
+  test "events missing from the callback event map are silently skipped" do
+    silent_wallet_class = Class.new(EmbeddedWallet) do
+      def self.name
+        "EmbeddabilityTest::SilentWallet"
+      end
+
+      self.callback_event_map = { debited: :embedded_debited }.freeze
+    end
+
+    wallet = silent_wallet_class.create_for_owner!(owner: users(:new_user), asset_code: :silent_asset)
+    wallet.credit(50, category: :embedded_reward)
+
+    assert_empty EmbeddedCallbacks.events, "unmapped credited event must not dispatch"
+
+    wallet.debit(10, category: :embedded_charge)
+
+    assert_equal [:embedded_debited], EmbeddedCallbacks.events.map { |event| event[:event] }
   end
 
   test "embedded table names are used at runtime" do

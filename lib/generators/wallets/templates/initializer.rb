@@ -35,7 +35,8 @@ Wallets.configure do |config|
 
   # Extra business event labels so the ledger stays readable.
   # These extend the built-in defaults:
-  # :credit, :debit, :transfer, :expiration, :adjustment
+  # :credit, :debit, :transfer_in, :transfer_out, :refund,
+  # :reward, :purchase, :top_up, :adjustment
   #
   # config.additional_categories = %w[
   #   ride_fare

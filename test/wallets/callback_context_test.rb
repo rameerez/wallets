@@ -23,4 +23,11 @@ class Wallets::CallbackContextTest < ActiveSupport::TestCase
       context.to_h
     )
   end
+
+  test "owner is nil without a wallet" do
+    context = Wallets::CallbackContext.new(event: :balance_credited)
+
+    assert_nil context.owner
+    assert_equal({ event: :balance_credited }, context.to_h)
+  end
 end

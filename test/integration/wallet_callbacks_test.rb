@@ -198,4 +198,49 @@ class WalletCallbacksTest < ActiveSupport::TestCase
     assert_equal 5, events.first.metadata[:available]
     assert_equal 10, events.first.metadata[:required]
   end
+
+  test "a transfer dispatches debited, credited, and transfer_completed callbacks in order" do
+    events = []
+    Wallets.configure do |config|
+      config.on_balance_debited { |ctx| events << [:debited, ctx] }
+      config.on_balance_credited { |ctx| events << [:credited, ctx] }
+      config.on_transfer_completed { |ctx| events << [:completed, ctx] }
+    end
+
+    transfer = wallets_wallets(:rich_coins_wallet).transfer_to(
+      wallets_wallets(:peer_coins_wallet),
+      50,
+      category: :peer_payment
+    )
+
+    assert_equal [:debited, :credited, :completed], events.map(&:first)
+
+    debited_context = events[0].last
+    assert_equal :transfer_out, debited_context.category
+    assert_equal "peer_payment", debited_context.metadata["transfer_category"]
+    assert_equal wallets_wallets(:rich_coins_wallet).id, debited_context.wallet.id
+
+    credited_context = events[1].last
+    assert_equal :transfer_in, credited_context.category
+    assert_equal wallets_wallets(:peer_coins_wallet).id, credited_context.wallet.id
+
+    completed_context = events[2].last
+    assert_equal transfer.id, completed_context.transfer.id
+    assert_equal 50, completed_context.amount
+  end
+
+  test "transfer legs record balance snapshots on both wallets" do
+    sender = create_wallet(users(:new_user), asset_code: :snap, initial_balance: 100)
+    recipient = create_wallet(users(:peer_user), asset_code: :snap, initial_balance: 7)
+
+    transfer = sender.transfer_to(recipient, 40, category: :gift)
+
+    outbound = transfer.outbound_transaction
+    inbound = transfer.inbound_transactions.sole
+
+    assert_equal 100, outbound.balance_before
+    assert_equal 60, outbound.balance_after
+    assert_equal 7, inbound.balance_before
+    assert_equal 47, inbound.balance_after
+  end
 end

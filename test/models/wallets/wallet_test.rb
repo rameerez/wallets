@@ -239,4 +239,373 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     assert_equal(-40, wallet.reload.balance)
     assert_equal 4, wallet.transactions.where("amount < 0").count
   end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Balance, expiration, and FIFO order
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "balance excludes credits once they expire" do
+    wallet = create_wallet(users(:new_user), asset_code: :promo)
+    wallet.credit(100, category: :reward, expires_at: 2.days.from_now)
+    wallet.credit(40, category: :top_up)
+
+    assert_equal 140, wallet.balance
+
+    travel 3.days do
+      assert_equal 40, wallet.balance
+    end
+  end
+
+  test "debit consumes the soonest-expiring bucket before older evergreen credits" do
+    wallet = create_wallet(users(:new_user), asset_code: :data)
+    evergreen = wallet.credit(100, category: :top_up)
+    expiring = wallet.credit(50, category: :reward, expires_at: 2.days.from_now)
+
+    spend = wallet.debit(60, category: :purchase)
+    allocations = spend.outgoing_allocations.order(:id)
+
+    assert_equal expiring.id, allocations.first.source_transaction_id, "expiring value is spent first"
+    assert_equal 50, allocations.first.amount
+    assert_equal evergreen.id, allocations.second.source_transaction_id
+    assert_equal 10, allocations.second.amount
+  end
+
+  test "debit never allocates from expired buckets" do
+    wallet = create_wallet(users(:new_user), asset_code: :stale)
+    expiring = wallet.credit(100, category: :reward, expires_at: 1.day.from_now)
+    evergreen = wallet.credit(50, category: :top_up)
+
+    travel 2.days do
+      spend = wallet.debit(30, category: :purchase)
+
+      assert_equal [evergreen.id], spend.outgoing_allocations.pluck(:source_transaction_id)
+      assert_equal 0, expiring.reload.allocated_amount
+      assert_equal 20, wallet.balance
+    end
+  end
+
+  test "debit can empty the wallet exactly to zero" do
+    wallet = create_wallet(users(:new_user), asset_code: :exact, initial_balance: 75)
+
+    spend = wallet.debit(75, category: :purchase)
+
+    assert_equal 0, wallet.reload.balance
+    assert_equal(-75, spend.amount)
+    assert_equal 0, spend.unbacked_amount
+  end
+
+  test "history orders transactions chronologically with id as tiebreaker" do
+    wallet = create_wallet(users(:new_user), asset_code: :hist)
+    ids = freeze_time do
+      3.times.map { |i| wallet.credit(10 + i, category: :top_up).id }
+    end
+
+    assert_equal ids, wallet.history.where(id: ids).pluck(:id)
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Amount validation edges
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "credit and debit reject invalid amounts with ArgumentError" do
+    wallet = wallets_wallets(:rich_coins_wallet)
+
+    [nil, 0, -5, 10.5, "10", :ten, Float::INFINITY, Float::NAN].each do |bad_amount|
+      assert_raises(ArgumentError, "credit(#{bad_amount.inspect}) should raise") { wallet.credit(bad_amount) }
+      assert_raises(ArgumentError, "debit(#{bad_amount.inspect}) should raise") { wallet.debit(bad_amount) }
+    end
+  end
+
+  test "whole-number floats are accepted and stored as integers" do
+    wallet = create_wallet(users(:new_user), asset_code: :floaty)
+
+    transaction = wallet.credit(10.0, category: :top_up)
+
+    assert_equal 10, transaction.amount
+    assert_equal 10, wallet.reload.balance
+  end
+
+  test "has_enough_balance? handles edge inputs gracefully" do
+    wallet = wallets_wallets(:rich_coins_wallet) # balance 1000
+
+    assert wallet.has_enough_balance?(1000)
+    assert wallet.has_enough_balance?(999.0)
+    refute wallet.has_enough_balance?(1001)
+    refute wallet.has_enough_balance?(nil)
+    refute wallet.has_enough_balance?(0)
+    refute wallet.has_enough_balance?(-5)
+    refute wallet.has_enough_balance?(10.5)
+    refute wallet.has_enough_balance?(:lots)
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Expiration validation
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "credit rejects past expirations" do
+    wallet = wallets_wallets(:rich_coins_wallet)
+
+    error = assert_raises(ArgumentError) { wallet.credit(10, expires_at: 1.hour.ago) }
+    assert_includes error.message, "future"
+  end
+
+  test "credit rejects non-temporal expirations" do
+    wallet = wallets_wallets(:rich_coins_wallet)
+
+    assert_raises(ArgumentError) { wallet.credit(10, expires_at: 123) }
+    assert_raises(ArgumentError) { wallet.credit(10, expires_at: "not a date") }
+  end
+
+  test "credit accepts a Date and a parseable String as expiration" do
+    wallet = create_wallet(users(:new_user), asset_code: :seasonal)
+
+    from_date = wallet.credit(10, category: :reward, expires_at: Date.tomorrow)
+    from_string = wallet.credit(10, category: :reward, expires_at: 2.days.from_now.iso8601)
+
+    assert_equal Date.tomorrow, from_date.expires_at.to_date
+    assert from_string.expires_at.future?
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # create_for_owner! race and conflict paths
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "create_for_owner returns the winner's wallet when losing a duplicate-insert race" do
+    owner = users(:new_user)
+    existing = create_wallet(owner, asset_code: :raced)
+
+    Wallets::Wallet.stubs(:find_by).returns(nil).then.returns(existing)
+    Wallets::Wallet.stubs(:create!).raises(ActiveRecord::RecordNotUnique.new("duplicate key"))
+
+    assert_equal existing.id, Wallets::Wallet.create_for_owner!(owner: owner, asset_code: :raced).id
+  end
+
+  test "create_for_owner re-raises duplicate-insert errors when no wallet actually exists" do
+    Wallets::Wallet.stubs(:create!).raises(ActiveRecord::RecordNotUnique.new("duplicate key"))
+
+    assert_raises(ActiveRecord::RecordNotUnique) do
+      Wallets::Wallet.create_for_owner!(owner: users(:new_user), asset_code: :ghost_asset)
+    end
+  end
+
+  test "create_for_owner re-raises validation failures unrelated to the uniqueness conflict" do
+    invalid_record = Wallets::Wallet.new
+    invalid_record.errors.add(:balance, :invalid)
+    Wallets::Wallet.stubs(:create!).raises(ActiveRecord::RecordInvalid.new(invalid_record))
+
+    assert_raises(ActiveRecord::RecordInvalid) do
+      Wallets::Wallet.create_for_owner!(owner: users(:new_user), asset_code: :broken_asset)
+    end
+  end
+
+  test "create_for_owner survives a real duplicate insert inside a caller's transaction" do
+    # This is the exact shape of the production race: the uniqueness
+    # validation misses a concurrent row, the INSERT hits the unique index
+    # for real, and all of it happens inside the caller's transaction (like
+    # `after_create` wallet auto-creation). On PostgreSQL a unique-index
+    # violation aborts the transaction it ran in, so recovering requires the
+    # gem to write through a savepoint and rescue outside of it.
+    owner = users(:new_user)
+    existing = create_wallet(owner, asset_code: :hard_race)
+
+    Wallets::Wallet.define_singleton_method(:create!) do |**attributes|
+      record = new(**attributes)
+      record.save!(validate: false) # skip the uniqueness SELECT, hit the index
+      record
+    end
+
+    begin
+      result = nil
+      ActiveRecord::Base.transaction do
+        result = Wallets::Wallet.create_for_owner!(owner: owner, asset_code: :hard_race)
+        assert User.count.positive?, "outer transaction must remain usable after the rescued conflict"
+      end
+
+      assert_equal existing.id, result.id
+    ensure
+      Wallets::Wallet.singleton_class.send(:remove_method, :create!)
+    end
+  end
+
+  test "create_for_owner normalizes asset codes and persists metadata" do
+    wallet = Wallets::Wallet.create_for_owner!(
+      owner: users(:new_user),
+      asset_code: " EUR ",
+      metadata: { "tier" => "vip" }
+    )
+
+    assert_equal "eur", wallet.asset_code
+    assert_equal "vip", wallet.reload.metadata[:tier]
+  end
+
+  test "create_for_owner rejects blank and fractional inputs" do
+    owner = users(:new_user)
+
+    assert_raises(ArgumentError) { Wallets::Wallet.create_for_owner!(owner: owner, asset_code: "   ") }
+    assert_raises(ArgumentError) { Wallets::Wallet.create_for_owner!(owner: owner, asset_code: :ok, initial_balance: 10.5) }
+    assert_raises(ArgumentError) { Wallets::Wallet.create_for_owner!(owner: owner, asset_code: :ok, initial_balance: Float::INFINITY) }
+  end
+
+  test "create_for_owner treats a nil initial balance as zero and coerces non-hash metadata" do
+    wallet = Wallets::Wallet.create_for_owner!(
+      owner: users(:new_user),
+      asset_code: :lenient,
+      initial_balance: nil,
+      metadata: "not a hash"
+    )
+
+    assert_equal 0, wallet.balance
+    assert_equal({}, wallet.metadata)
+    assert_empty wallet.transactions, "no seed credit is written for a zero initial balance"
+  end
+
+  test "credit and debit coerce non-hash metadata to an empty hash" do
+    wallet = create_wallet(users(:new_user), asset_code: :tolerant, initial_balance: 50)
+
+    credit = wallet.credit(10, category: :reward, metadata: "not a hash")
+    debit = wallet.debit(5, category: :purchase, metadata: 42)
+
+    assert_equal %w[balance_after balance_before], credit.metadata.keys.sort
+    assert_equal %w[balance_after balance_before], debit.metadata.keys.sort
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Wallet validations and metadata
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "duplicate wallets for the same owner and asset are invalid" do
+    existing = wallets_wallets(:rich_coins_wallet)
+    duplicate = Wallets::Wallet.new(owner: existing.owner, asset_code: "coins", balance: 0)
+
+    refute duplicate.valid?
+    assert duplicate.errors.of_kind?(:asset_code, :taken)
+  end
+
+  test "wallet requires a present asset code and an integer balance" do
+    wallet = Wallets::Wallet.new(owner: users(:new_user), asset_code: "   ", balance: 1.5)
+
+    refute wallet.valid?
+    assert wallet.errors[:asset_code].any?
+    assert wallet.errors[:balance].any?
+  end
+
+  test "wallet asset codes are normalized before validation" do
+    wallet = Wallets::Wallet.create!(owner: users(:new_user), asset_code: " GOLD ", balance: 0)
+
+    assert_equal "gold", wallet.asset_code
+  end
+
+  test "wallet metadata reads with indifferent access and mutations survive save" do
+    wallet = Wallets::Wallet.create_for_owner!(owner: users(:new_user), asset_code: :meta, metadata: { "tier" => "vip" })
+
+    assert_equal "vip", wallet.metadata[:tier]
+
+    wallet.metadata[:flag] = true
+    wallet.save!
+    assert Wallets::Wallet.find(wallet.id).metadata[:flag]
+
+    wallet.metadata = nil
+    assert_equal({}, wallet.metadata)
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Allocation safety net
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "debit raises when allocations cannot cover the amount even after the balance check" do
+    # Safety net for the rare race where a bucket expires between the
+    # balance pre-check and the FIFO allocation query.
+    wallet = create_wallet(users(:new_user), asset_code: :race_guard, initial_balance: 100)
+    wallet.stubs(:allocate_debit!).returns(25)
+
+    error = assert_raises(Wallets::InsufficientBalance) { wallet.debit(50, category: :purchase) }
+    assert_includes error.message, "balance buckets"
+  end
+
+  test "preserve refuses to fabricate inbound credits when allocations do not cover the amount" do
+    # Deep safety net: if the FIFO allocation invariant ever broke mid-transfer,
+    # the receiver must not be credited buckets that do not add up.
+    wallet = wallets_wallets(:rich_coins_wallet)
+    transfer = stub(id: 42)
+    allocation = stub(amount: 30, source_transaction: stub(expires_at: nil))
+    outbound = stub(outgoing_allocations: stub(includes: stub(order: stub(to_a: [allocation]))))
+
+    error = assert_raises(Wallets::InvalidTransfer) do
+      wallet.send(:build_preserved_transfer_inbound_credit_specs, transfer, outbound, 100)
+    end
+
+    assert_includes error.message, "could not preserve expiration buckets"
+  end
+
+  test "inbound credit specs reject policies that slipped past resolution" do
+    wallet = wallets_wallets(:rich_coins_wallet)
+
+    assert_raises(ArgumentError) do
+      wallet.send(
+        :build_transfer_inbound_credit_specs,
+        transfer: nil, outbound_transaction: nil, amount: 10,
+        expiration_policy: "bogus", expires_at: nil
+      )
+    end
+  end
+
+  test "lock_wallet_pair! locks the same row only once when handed twin instances" do
+    wallet = wallets_wallets(:rich_coins_wallet)
+    twin = Wallets::Wallet.find(wallet.id)
+
+    ActiveRecord::Base.transaction do
+      assert_nothing_raised { wallet.send(:lock_wallet_pair!, twin) }
+    end
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Destroy semantics
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "destroying a wallet with outgoing transfer history preserves the counterparty's ledger" do
+    sender_owner = User.create!(email: "dst-a-#{SecureRandom.hex(4)}@example.com", name: "A")
+    receiver_owner = User.create!(email: "dst-b-#{SecureRandom.hex(4)}@example.com", name: "B")
+    sender = sender_owner.wallet(:coins)
+    receiver = receiver_owner.wallet(:coins)
+    sender.credit(100, category: :top_up)
+    transfer = sender.transfer_to(receiver, 40, category: :peer_payment)
+    transfer_id = transfer.id
+
+    assert_difference -> { Wallets::Transfer.count }, -1 do
+      sender.destroy!
+    end
+
+    inbound = receiver.transactions.credits.sole
+    assert_equal 40, receiver.reload.balance, "the receiver keeps the transferred value"
+    assert_nil inbound.reload.transfer_id, "the link object is gone"
+    assert_equal transfer_id, inbound.metadata[:transfer_id], "metadata still records the transfer for audit"
+  end
+
+  test "destroying the receiving wallet keeps the sender's ledger intact" do
+    sender_owner = User.create!(email: "dst-c-#{SecureRandom.hex(4)}@example.com", name: "C")
+    receiver_owner = User.create!(email: "dst-d-#{SecureRandom.hex(4)}@example.com", name: "D")
+    sender = sender_owner.wallet(:coins)
+    receiver = receiver_owner.wallet(:coins)
+    sender.credit(100, category: :top_up)
+    sender.transfer_to(receiver, 40, category: :peer_payment)
+
+    receiver.destroy!
+
+    outbound = sender.transactions.debits.sole
+    assert_nil outbound.reload.transfer_id
+    assert_equal 60, sender.reload.balance
+  end
+
+  test "destroying an owner removes their wallets, transactions, and allocations" do
+    owner = User.create!(email: "cascade-#{SecureRandom.hex(4)}@example.com", name: "Cascade")
+    wallet = owner.wallet(:coins)
+    wallet.credit(30, category: :top_up)
+    wallet.debit(10, category: :purchase)
+    wallet_id = wallet.id
+
+    owner.destroy!
+
+    assert_empty Wallets::Wallet.where(id: wallet_id)
+    assert_empty Wallets::Transaction.where(wallet_id: wallet_id)
+  end
 end

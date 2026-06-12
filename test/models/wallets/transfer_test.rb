@@ -450,4 +450,197 @@ class Wallets::TransferTest < ActiveSupport::TestCase
     refute transfer.valid?
     assert_includes transfer.errors[:expiration_policy], "is not included in the list"
   end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # transfer_to guards
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "transfer_to rejects a nil target" do
+    error = assert_raises(Wallets::InvalidTransfer) do
+      wallets_wallets(:rich_coins_wallet).transfer_to(nil, 10)
+    end
+
+    assert_equal "Target wallet is required", error.message
+  end
+
+  test "transfer_to rejects an unpersisted source wallet" do
+    unsaved = Wallets::Wallet.new(owner: users(:new_user), asset_code: :coins)
+
+    error = assert_raises(Wallets::InvalidTransfer) do
+      unsaved.transfer_to(wallets_wallets(:peer_coins_wallet), 10)
+    end
+
+    assert_equal "Source wallet must be persisted", error.message
+  end
+
+  test "transfer_to rejects an unpersisted target wallet" do
+    unsaved = Wallets::Wallet.new(owner: users(:new_user), asset_code: :coins)
+
+    error = assert_raises(Wallets::InvalidTransfer) do
+      wallets_wallets(:rich_coins_wallet).transfer_to(unsaved, 10)
+    end
+
+    assert_equal "Target wallet must be persisted", error.message
+  end
+
+  test "transfer_to rejects transferring to the same wallet" do
+    wallet = wallets_wallets(:rich_coins_wallet)
+
+    error = assert_raises(Wallets::InvalidTransfer) { wallet.transfer_to(wallet, 10) }
+    assert_equal "Cannot transfer to the same wallet", error.message
+
+    same_row = Wallets::Wallet.find(wallet.id)
+    assert_raises(Wallets::InvalidTransfer) { wallet.transfer_to(same_row, 10) }
+  end
+
+  test "transfer_to validates the amount before touching the ledger" do
+    source_wallet = wallets_wallets(:rich_coins_wallet)
+    target_wallet = wallets_wallets(:peer_coins_wallet)
+
+    [nil, 0, -10, 2.5].each do |bad_amount|
+      assert_no_difference -> { Wallets::Transfer.count } do
+        assert_raises(ArgumentError) { source_wallet.transfer_to(target_wallet, bad_amount) }
+      end
+    end
+  end
+
+  test "expires_at cannot be combined with preserve or none policies" do
+    source_wallet = wallets_wallets(:rich_coins_wallet)
+    target_wallet = wallets_wallets(:peer_coins_wallet)
+
+    %i[preserve none].each do |policy|
+      error = assert_raises(ArgumentError) do
+        source_wallet.transfer_to(target_wallet, 10, expiration_policy: policy, expires_at: 1.day.from_now)
+      end
+
+      assert_includes error.message, "cannot be combined"
+    end
+  end
+
+  test "transfer expiration policy falls back to preserve when config does not define one" do
+    sender = create_wallet(users(:new_user), asset_code: :minimal, initial_balance: 50)
+    recipient = create_wallet(users(:peer_user), asset_code: :minimal)
+
+    minimal_config = Struct.new(:table_prefix, :allow_negative_balance, :low_balance_threshold)
+                           .new("wallets_", false, nil)
+    Wallets::Wallet.stubs(:resolved_config).returns(minimal_config)
+
+    transfer = sender.transfer_to(recipient, 10, category: :gift)
+
+    assert_equal "preserve", transfer.expiration_policy
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Transfer model validations and leg queries
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "transfer model rejects an asset code that does not match the wallets" do
+    transfer = Wallets::Transfer.new(
+      from_wallet: wallets_wallets(:rich_coins_wallet),
+      to_wallet: wallets_wallets(:peer_coins_wallet),
+      asset_code: :gems,
+      amount: 10,
+      expiration_policy: :preserve
+    )
+
+    refute transfer.valid?
+    assert_includes transfer.errors[:asset_code], "must match both wallets"
+  end
+
+  test "transfer model requires a category" do
+    transfer = Wallets::Transfer.new(
+      from_wallet: wallets_wallets(:rich_coins_wallet),
+      to_wallet: wallets_wallets(:peer_coins_wallet),
+      asset_code: :coins,
+      amount: 10,
+      category: nil,
+      expiration_policy: :preserve
+    )
+
+    refute transfer.valid?
+    assert_includes transfer.errors[:category], "can't be blank"
+  end
+
+  test "transfer model normalizes asset code and expiration policy" do
+    transfer = Wallets::Transfer.new(
+      from_wallet: wallets_wallets(:rich_coins_wallet),
+      to_wallet: wallets_wallets(:peer_coins_wallet),
+      asset_code: " COINS ",
+      amount: 10,
+      expiration_policy: " PRESERVE "
+    )
+
+    assert transfer.valid?
+    assert_equal "coins", transfer.asset_code
+    assert_equal "preserve", transfer.expiration_policy
+  end
+
+  test "inbound_transaction returns the single inbound leg when there is exactly one" do
+    sender = create_wallet(users(:new_user), asset_code: :single_leg, initial_balance: 100)
+    recipient = create_wallet(users(:peer_user), asset_code: :single_leg)
+
+    transfer = sender.transfer_to(recipient, 25, category: :gift)
+
+    assert_equal transfer.inbound_transactions.sole.id, transfer.inbound_transaction.id
+    assert_equal transfer.outbound_transactions.sole.id, transfer.outbound_transaction.id
+  end
+
+  test "leg queries are empty on an unpersisted transfer" do
+    transfer = Wallets::Transfer.new
+
+    assert_empty transfer.outbound_transactions
+    assert_empty transfer.inbound_transactions
+    assert_nil transfer.outbound_transaction
+    assert_nil transfer.inbound_transaction
+  end
+
+  test "a bare transfer is invalid without crashing the validation guards" do
+    transfer = Wallets::Transfer.new
+
+    refute transfer.valid?
+    assert transfer.errors[:from_wallet].any?
+    assert transfer.errors[:to_wallet].any?
+    assert transfer.errors[:amount].any?
+  end
+
+  test "transfer metadata reads with indifferent access and mutations survive save" do
+    sender = create_wallet(users(:new_user), asset_code: :meta_check, initial_balance: 50)
+    recipient = create_wallet(users(:peer_user), asset_code: :meta_check)
+    transfer = sender.transfer_to(recipient, 10, category: :gift, metadata: { "note" => "hi" })
+
+    assert_equal "hi", transfer.metadata[:note]
+
+    transfer.metadata[:flagged] = true
+    transfer.save!
+
+    assert Wallets::Transfer.find(transfer.id).metadata[:flagged]
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Concurrency
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "simultaneous opposing transfers serialize without deadlocking" do
+    # `lock_wallet_pair!` always locks the wallet with the smaller id first,
+    # so two opposing transfers (A→B and B→A) can never each hold one lock
+    # while waiting on the other.
+    alice = create_wallet(users(:new_user), asset_code: :duel, initial_balance: 100)
+    bob = create_wallet(users(:peer_user), asset_code: :duel, initial_balance: 100)
+
+    start_line = Queue.new
+    threads = [[alice, bob], [bob, alice]].map do |from, to|
+      Thread.new do
+        ActiveRecord::Base.connection_pool.with_connection do
+          start_line.pop
+          from.class.find(from.id).transfer_to(to.class.find(to.id), 10, category: :peer_payment)
+        end
+      end
+    end
+    2.times { start_line << true }
+    threads.each(&:join)
+
+    assert_equal 100, alice.reload.balance
+    assert_equal 100, bob.reload.balance
+    assert_equal 2, Wallets::Transfer.where(from_wallet_id: [alice.id, bob.id]).count
+  end
 end

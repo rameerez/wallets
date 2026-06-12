@@ -11,19 +11,30 @@ module Wallets
       def has_wallets(**options)
         include Wallets::HasWallets unless included_modules.include?(Wallets::HasWallets)
 
-        @wallet_options = {
-          default_asset: Wallets.configuration.default_asset,
-          auto_create: true,
-          initial_balance: 0
-        }.merge(options)
+        @wallet_options = options
       end
 
+      # Resolved lazily on every call so subclasses inherit their parent's
+      # `has_wallets` declaration and so `Wallets.configuration.default_asset`
+      # is honored no matter when the host app's initializer ran.
       def wallet_options
-        @wallet_options ||= {
+        {
           default_asset: Wallets.configuration.default_asset,
           auto_create: true,
           initial_balance: 0
-        }
+        }.merge(declared_wallet_options)
+      end
+
+      private
+
+      def declared_wallet_options
+        if defined?(@wallet_options) && @wallet_options
+          @wallet_options
+        elsif superclass.respond_to?(:declared_wallet_options, true)
+          superclass.send(:declared_wallet_options)
+        else
+          {}
+        end
       end
     end
 
@@ -45,7 +56,7 @@ module Wallets
     end
 
     def wallet?(asset_code = nil)
-      find_wallet(asset_code || wallet_options[:default_asset]).present?
+      find_wallet(asset_code).present?
     end
 
     def main_wallet
@@ -53,7 +64,7 @@ module Wallets
     end
 
     def find_wallet(asset_code = nil)
-      normalized_asset_code = normalize_asset_code(asset_code || wallet_options[:default_asset])
+      normalized_asset_code = Wallets.normalize_asset_code(asset_code || wallet_options[:default_asset])
       wallets.find_by(asset_code: normalized_asset_code)
     end
 
@@ -67,7 +78,7 @@ module Wallets
       existing_wallet = find_wallet(asset_code)
       return existing_wallet if existing_wallet.present?
       return unless should_auto_create_wallet?
-      raise "Cannot create wallet for unsaved owner" unless persisted?
+      raise Wallets::Error, "Cannot create wallet for unsaved owner" unless persisted?
 
       Wallet.create_for_owner!(
         owner: self,
@@ -80,12 +91,8 @@ module Wallets
       main_wallet
     end
 
-    def normalize_asset_code(value)
-      value.to_s.strip.downcase
-    end
-
     def initial_balance_for(asset_code)
-      return 0 unless normalize_asset_code(asset_code) == normalize_asset_code(wallet_options[:default_asset])
+      return 0 unless Wallets.normalize_asset_code(asset_code) == Wallets.normalize_asset_code(wallet_options[:default_asset])
 
       wallet_options[:initial_balance] || 0
     end

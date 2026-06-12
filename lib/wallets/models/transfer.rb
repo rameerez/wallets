@@ -9,59 +9,46 @@ module Wallets
   # receiver can preserve the sender's expiration buckets when one transfer
   # consumes multiple source transactions with different expirations.
   class Transfer < ApplicationRecord
-    class_attribute :embedded_table_name, default: nil
-    class_attribute :config_provider, default: -> { Wallets.configuration }
+    include Wallets::Embeddable
+    include Wallets::HasMetadata
+
+    self.table_suffix = "transfers"
+
     class_attribute :transaction_class_name, default: "Wallets::Transaction"
 
     SUPPORTED_EXPIRATION_POLICIES = %w[preserve none fixed].freeze
-
-    def self.table_name
-      embedded_table_name || "#{resolved_config.table_prefix}transfers"
-    end
-
-    def self.resolved_config
-      value = config_provider
-      value.respond_to?(:call) ? value.call : value
-    end
 
     def self.transaction_class
       transaction_class_name.constantize
     end
 
-    belongs_to :from_wallet, class_name: "Wallets::Wallet", inverse_of: :outgoing_transfers
-    belongs_to :to_wallet, class_name: "Wallets::Wallet", inverse_of: :incoming_transfers
+    # Explicit `optional: false` because the gem's models load before Rails
+    # applies `belongs_to_required_by_default`.
+    belongs_to :from_wallet, class_name: "Wallets::Wallet", inverse_of: :outgoing_transfers, optional: false
+    belongs_to :to_wallet, class_name: "Wallets::Wallet", inverse_of: :incoming_transfers, optional: false
 
+    # When a transfer record goes away (e.g. one side's wallet or owner is
+    # destroyed), the counterparty's ledger rows must survive: only the link
+    # is cleared. The transaction metadata still carries `transfer_id` and the
+    # counterparty details for audit purposes.
     has_many :transactions,
              class_name: "Wallets::Transaction",
              foreign_key: :transfer_id,
-             inverse_of: :transfer
+             inverse_of: :transfer,
+             dependent: :nullify
 
     validates :asset_code, presence: true
     validates :amount, presence: true, numericality: { only_integer: true, greater_than: 0 }
+    validates :category, presence: true
     validates :expiration_policy, presence: true, inclusion: { in: SUPPORTED_EXPIRATION_POLICIES }
     validate :wallets_must_differ
     validate :wallet_assets_match_transfer_asset
 
     before_validation :normalize_asset_code!
     before_validation :normalize_expiration_policy!
-    before_save :sync_metadata_cache
-
-    def metadata
-      @indifferent_metadata ||= ActiveSupport::HashWithIndifferentAccess.new(super || {})
-    end
-
-    def metadata=(hash)
-      @indifferent_metadata = nil
-      super(hash.respond_to?(:to_h) ? hash.to_h : {})
-    end
-
-    def reload(*)
-      @indifferent_metadata = nil
-      super
-    end
 
     def outbound_transactions
-      transfer_transactions_for(wallet_id: from_wallet_id).where("amount < 0")
+      transfer_transactions_for(wallet_id: from_wallet_id).debits
     end
 
     def outbound_transaction
@@ -69,7 +56,7 @@ module Wallets
     end
 
     def inbound_transactions
-      transfer_transactions_for(wallet_id: to_wallet_id).where("amount > 0")
+      transfer_transactions_for(wallet_id: to_wallet_id).credits
     end
 
     def inbound_transaction
@@ -84,7 +71,7 @@ module Wallets
     end
 
     def normalize_asset_code!
-      self.asset_code = asset_code.to_s.strip.downcase.presence
+      self.asset_code = Wallets.normalize_asset_code(asset_code).presence
     end
 
     def normalize_expiration_policy!
@@ -103,14 +90,6 @@ module Wallets
       return if from_wallet.asset_code == asset_code && to_wallet.asset_code == asset_code
 
       errors.add(:asset_code, "must match both wallets")
-    end
-
-    def sync_metadata_cache
-      if @indifferent_metadata
-        write_attribute(:metadata, @indifferent_metadata.to_h)
-      elsif read_attribute(:metadata).nil?
-        write_attribute(:metadata, {})
-      end
     end
 
     def transfer_transactions_for(wallet_id:)

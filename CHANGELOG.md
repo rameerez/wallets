@@ -1,3 +1,40 @@
+## [Unreleased]
+
+### Fixed
+
+- **Host app model shadowing.** The engine no longer adds the gem's `lib` directories to the host app's autoload paths. Those paths made Zeitwerk claim top-level constants like `::Wallet`, `::Transaction`, `::Transfer`, and `::Allocation` — so any host app with its own model by one of those (very common) names found it shadowed and unresolvable (`NameError: uninitialized constant Transaction`). All gem code is required eagerly by `lib/wallets.rb`, so the autoload paths were never needed.
+- **Owners with transfer history could not be destroyed.** `Wallets::Transfer#transactions` now uses `dependent: :nullify`. Previously, destroying a wallet (or its owner) that had ever sent or received a transfer raised `ActiveRecord::InvalidForeignKey`: the transfer row was destroyed while the counterparty's ledger row still pointed at it. Now the link object is cleared while both sides' ledger rows — and the counterparty's balance — survive intact; transaction metadata still carries `transfer_id` and counterparty details for audit.
+- **`create_for_owner!` race recovery now works on PostgreSQL.** The duplicate-insert rescue ran inside the same transaction as the failed `INSERT`. On PostgreSQL a unique-index violation aborts that transaction, so the recovery `SELECT` raised `PG::InFailedSqlTransaction` instead of returning the winner's wallet — precisely in the concurrent-creation scenario the rescue exists for. The create now writes through a savepoint (`requires_new: true`) and rescues outside it, which also keeps a caller's surrounding transaction (e.g. `after_create` wallet auto-creation) usable after a lost race.
+- **`belongs_to` requiredness is now explicit.** The gem's models load before Rails applies `belongs_to_required_by_default`, so all ledger associations were silently optional: an orphan `Transaction`/`Allocation`/`Transfer` passed validation and crashed later with a database-level `NotNullViolation`. All required associations now declare `optional: false` and fail with friendly validation errors regardless of host app configuration or load order.
+- **`has_wallets` options now reach subclasses.** Wallet options were stored in a class-level ivar that STI/inheritance never saw, so a subclass of a model with `has_wallets default_asset: :coins` silently fell back to the global default asset. Options are now resolved lazily through the ancestor chain; subclasses inherit their parent's declaration and can override it with their own `has_wallets`. Lazy resolution also means `Wallets.configuration.default_asset` is honored no matter when the host app's initializer ran relative to model loading.
+- **Unknown callback events no longer break ledger writes.** `Wallets::Callbacks.dispatch` promised error isolation but raised `NoMethodError` (mid-transaction!) when handed an event with no matching `on_<event>_callback` reader — e.g. from an embedded subclass with a custom `callback_event_map` but the default callbacks module. Unknown events are now ignored.
+- `transfer_to` raises a friendly `Wallets::InvalidTransfer` ("Source wallet must be persisted") instead of a confusing `ArgumentError` from internal lock ordering when called on an unpersisted wallet.
+- Amount validation no longer leaks internal errors: `credit`/`debit`/`transfer_to` with `Float::INFINITY`, `Float::NAN`, or a non-numeric like a `Symbol` now raise `ArgumentError` (previously `FloatDomainError`/`NoMethodError`), and `has_enough_balance?` returns `false` for them instead of crashing.
+- `expires_at` given as a `String` is now validated by parsing it (`"2030-01-01"` works; garbage raises a clear `ArgumentError`). Previously any string — valid or not — crashed with "comparison of String with Time failed".
+- `wallet()` on an unsaved owner raises `Wallets::Error` instead of a bare `RuntimeError`, so `rescue Wallets::Error` catches everything the gem raises.
+- `Transaction.expired` scope and `Transaction#expired?` now treat a transaction expiring exactly "now" as expired (`<=` instead of `<`), matching `not_expired` and the balance math, so the two scopes partition the ledger cleanly at any instant.
+- The install initializer template now lists the gem's real default categories (it previously mentioned `:transfer` and `:expiration`, which don't exist).
+- `Appraisals` was out of sync with `gemfiles/` and CI (it listed Rails 6.1–8.0; the tested matrix is Rails 7.2 and 8.1).
+
+### Changed
+
+- `Wallet#history` orders by `created_at` with `id` as tiebreaker, so same-instant transactions (e.g. both legs of a transfer) have a deterministic order.
+- `transfer_to` opens its transaction via the wallet class (`self.class.transaction`) instead of `ActiveRecord::Base.transaction`, so embedded wallet subclasses connected to a different database transact on the right connection.
+- Removed the redundant `Wallets::Railtie` (the engine already is a railtie; the extra one did nothing).
+- `Wallets::Transfer` now validates `category` presence at the model layer instead of failing with a database `NOT NULL` violation.
+
+### Added
+
+- `Wallets.normalize_asset_code(value)` — the single source of truth for asset code normalization (`" EUR "`, `:EUR`, and `"eur"` all name the same wallet), used consistently across configuration, wallets, transfers, and owner lookups.
+- `Wallets::Embeddable` concern — the embeddability plumbing (`embedded_table_name`, `config_provider`, `resolved_config`, prefix-derived table names) extracted from the four models into one place. Embedded subclasses without an explicit `embedded_table_name` derive `"#{config.table_prefix}#{table_suffix}"` automatically.
+- `Wallets::HasMetadata` concern — the indifferent-access metadata behavior (hash coercion, mutation-safe saves, NULL-column healing for MySQL) extracted from the three metadata-carrying models into one place.
+
+### Tests
+
+- Test suite grew from 92 runs / 338 assertions to 186 runs / 667 assertions. Line coverage 93.45% → 100%, branch coverage 65.93% → 99.39%; the SimpleCov gate is raised to 98% line / 85% branch.
+- New regression tests for every fix above, including a real duplicate-insert race executed inside a caller's transaction (exercises PostgreSQL savepoint semantics in CI), destroy cascades with transfer history, FIFO expiring-first allocation order, expiration boundary partitioning, amount/expiration edge cases, callback logging fallbacks, and STI wallet-option inheritance.
+- The install generator now runs in tests, and its generated migration is executed (up and down) against the real database adapter in CI.
+
 ## [0.2.0] - 2026-05-03
 
 ### Fixed

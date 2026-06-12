@@ -8,20 +8,14 @@ module Wallets
   # This class supports embedding: subclasses can override config and table
   # names without affecting the base Wallets::* behavior.
   class Allocation < ApplicationRecord
-    class_attribute :embedded_table_name, default: nil
-    class_attribute :config_provider, default: -> { Wallets.configuration }
+    include Wallets::Embeddable
 
-    def self.table_name
-      embedded_table_name || "#{resolved_config.table_prefix}allocations"
-    end
+    self.table_suffix = "allocations"
 
-    def self.resolved_config
-      value = config_provider
-      value.respond_to?(:call) ? value.call : value
-    end
-
-    belongs_to :spend_transaction, class_name: "Wallets::Transaction", foreign_key: "transaction_id"
-    belongs_to :source_transaction, class_name: "Wallets::Transaction"
+    # Explicit `optional: false` because the gem's models load before Rails
+    # applies `belongs_to_required_by_default`.
+    belongs_to :spend_transaction, class_name: "Wallets::Transaction", foreign_key: "transaction_id", optional: false
+    belongs_to :source_transaction, class_name: "Wallets::Transaction", optional: false
 
     validates :amount, presence: true, numericality: { only_integer: true, greater_than: 0 }
     validate :source_transaction_has_matching_asset
