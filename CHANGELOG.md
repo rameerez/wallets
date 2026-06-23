@@ -20,7 +20,7 @@
 
 - `Wallet#history` orders by `created_at` with `id` as tiebreaker, so same-instant transactions (e.g. both legs of a transfer) have a deterministic order.
 - `transfer_to` opens its transaction via the wallet class (`self.class.transaction`) instead of `ActiveRecord::Base.transaction`, so embedded wallet subclasses connected to a different database transact on the right connection.
-- Removed the redundant `Wallets::Railtie` (the engine already is a railtie; the extra one did nothing).
+- `Wallets::Railtie` is retained as a compatibility alias for `Wallets::Engine`; the engine remains the actual Rails integration point.
 - `Wallets::Transfer` now validates `category` presence at the model layer instead of failing with a database `NOT NULL` violation.
 
 ### Added
@@ -31,7 +31,7 @@
 
 ### Tests
 
-- Test suite grew from 92 runs / 338 assertions to 186 runs / 667 assertions. Line coverage 93.45% → 100%, branch coverage 65.93% → 99.39%; the SimpleCov gate is raised to 98% line / 85% branch.
+- Test suite grew from 92 runs / 338 assertions to 188 runs / 670 assertions. Line coverage 93.45% → 100%, branch coverage 65.93% → 98.8%; the SimpleCov gate is raised to 98% line / 85% branch.
 - New regression tests for every fix above, including a real duplicate-insert race executed inside a caller's transaction (exercises PostgreSQL savepoint semantics in CI), destroy cascades with transfer history, FIFO expiring-first allocation order, expiration boundary partitioning, amount/expiration edge cases, callback logging fallbacks, and STI wallet-option inheritance.
 - The install generator now runs in tests, and its generated migration is executed (up and down) against the real database adapter in CI.
 
