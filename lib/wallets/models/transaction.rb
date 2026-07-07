@@ -63,12 +63,21 @@ module Wallets
 
     before_save :sync_metadata_cache
 
-    scope :credits, -> { where("amount > 0") }
-    scope :debits, -> { where("amount < 0") }
+    # Column predicates go through `arel_table` rather than a raw
+    # `where("amount > 0")` string so the generated SQL is always
+    # TABLE-QUALIFIED (`"wallets_transactions"."amount" > 0`). A bare
+    # `amount` breaks the moment a host joins another table that also has an
+    # `amount` column — every wallet has an `amount` on BOTH transactions and
+    # transfers, so `wallet.transactions.joins(:transfer).credits` raised
+    # `PG::AmbiguousColumn` (SQLite/MySQL raise the equivalent). Arel also
+    # respects the embedding `table_name` override for free, since
+    # `arel_table` is derived from the resolved table name.
+    scope :credits, -> { where(arel_table[:amount].gt(0)) }
+    scope :debits, -> { where(arel_table[:amount].lt(0)) }
     scope :recent, -> { order(created_at: :desc) }
     scope :by_category, ->(category) { where(category: category) }
-    scope :not_expired, -> { where("expires_at IS NULL OR expires_at > ?", Time.current) }
-    scope :expired, -> { where("expires_at < ?", Time.current) }
+    scope :not_expired, -> { where(arel_table[:expires_at].eq(nil).or(arel_table[:expires_at].gt(Time.current))) }
+    scope :expired, -> { where(arel_table[:expires_at].lt(Time.current)) }
 
     def metadata
       @indifferent_metadata ||= ActiveSupport::HashWithIndifferentAccess.new(super || {})

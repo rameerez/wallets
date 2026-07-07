@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Fixed
+
+- The `credits`, `debits`, `not_expired`, and `expired` scopes now table-qualify their column predicates (via `arel_table`) instead of a bare `where("amount > 0")`. A bare column name is ambiguous the moment a host joins another table that also has that column — and every wallet has an `amount` on **both** `wallets_transactions` and `wallets_transfers`, so a natural query like `wallet.transactions.joins(:transfer).credits` (e.g. "which of my transactions belong to a reversal transfer?") raised `PG::AmbiguousColumn` (SQLite/MySQL raise the equivalent). `arel_table` also respects the embedding `table_name` override, so embedded/subclassed transaction tables get the correct qualification for free.
+
 ## [0.2.0] - 2026-05-03
 
 ### Fixed

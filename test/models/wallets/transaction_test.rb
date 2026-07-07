@@ -73,4 +73,31 @@ class Wallets::TransactionTest < ActiveSupport::TestCase
   ensure
     Wallets.configuration.allow_negative_balance = original_setting
   end
+
+  test "amount scopes qualify their column so they compose with a transfer join" do
+    # Regression: `credits`/`debits` used a bare `where(\"amount > 0\")`.
+    # Both `wallets_transactions` and `wallets_transfers` have an `amount`
+    # column, so the instant a host joined the two — e.g.
+    # `wallet.transactions.joins(:transfer).credits` to find the transactions
+    # belonging to a category of transfer — the database raised an ambiguous
+    # column error (PG::AmbiguousColumn; SQLite "ambiguous column name").
+    sender = User.create!(email: "amount-scope-sender-#{SecureRandom.hex(4)}@example.com", name: "Sender").wallet(:coins)
+    recipient = User.create!(email: "amount-scope-recipient-#{SecureRandom.hex(4)}@example.com", name: "Recipient").wallet(:coins)
+    sender.credit(500, category: :top_up)
+    transfer = sender.transfer_to(recipient, 120, category: :peer_payment)
+
+    # The join is what triggered the ambiguity; both scopes must survive it.
+    sender_debit = sender.transactions.joins(:transfer).debits.sole
+    recipient_credit = recipient.transactions.joins(:transfer).credits.sole
+
+    assert_equal(-120, sender_debit.amount)
+    assert_equal transfer.id, sender_debit.transfer_id
+    assert_equal 120, recipient_credit.amount
+    assert_equal transfer.id, recipient_credit.transfer_id
+
+    # DB-agnostic proof the column is table-qualified in the generated SQL.
+    table = Wallets::Transaction.table_name
+    assert_includes Wallets::Transaction.credits.to_sql, %("#{table}"."amount")
+    assert_includes Wallets::Transaction.debits.to_sql, %("#{table}"."amount")
+  end
 end
