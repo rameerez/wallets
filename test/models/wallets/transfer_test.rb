@@ -14,7 +14,7 @@ class Wallets::TransferTest < ActiveSupport::TestCase
       target_wallet,
       250,
       category: :peer_payment,
-      metadata: { note: "Thanks for the help" }
+      metadata: {note: "Thanks for the help"}
     )
 
     assert transfer.persisted?
@@ -522,7 +522,7 @@ class Wallets::TransferTest < ActiveSupport::TestCase
     recipient = create_wallet(users(:peer_user), asset_code: :minimal)
 
     minimal_config = Struct.new(:table_prefix, :allow_negative_balance, :low_balance_threshold)
-                           .new("wallets_", false, nil)
+      .new("wallets_", false, nil)
     Wallets::Wallet.stubs(:resolved_config).returns(minimal_config)
 
     transfer = sender.transfer_to(recipient, 10, category: :gift)
@@ -606,7 +606,7 @@ class Wallets::TransferTest < ActiveSupport::TestCase
   test "transfer metadata reads with indifferent access and mutations survive save" do
     sender = create_wallet(users(:new_user), asset_code: :meta_check, initial_balance: 50)
     recipient = create_wallet(users(:peer_user), asset_code: :meta_check)
-    transfer = sender.transfer_to(recipient, 10, category: :gift, metadata: { "note" => "hi" })
+    transfer = sender.transfer_to(recipient, 10, category: :gift, metadata: {"note" => "hi"})
 
     assert_equal "hi", transfer.metadata[:note]
 

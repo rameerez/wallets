@@ -18,11 +18,11 @@ module Wallets
     # =========================================
 
     attr_reader :on_balance_credited_callback,
-                :on_balance_debited_callback,
-                :on_transfer_completed_callback,
-                :on_low_balance_reached_callback,
-                :on_balance_depleted_callback,
-                :on_insufficient_balance_callback
+      :on_balance_debited_callback,
+      :on_transfer_completed_callback,
+      :on_low_balance_reached_callback,
+      :on_balance_depleted_callback,
+      :on_insufficient_balance_callback
 
     def initialize
       # Keep the out-of-the-box default close to the most common "main wallet"
@@ -59,7 +59,7 @@ module Wallets
 
     def low_balance_threshold=(value)
       if value
-        value = Integer(value)
+        value = Wallets::WholeNumber.parse(value, name: "Low balance threshold", allow_string: true)
         raise ArgumentError, "Low balance threshold must be greater than or equal to zero" if value.negative?
       end
 
@@ -77,7 +77,7 @@ module Wallets
       normalized_value = value.to_s.strip.downcase.to_sym
       allowed_values = %i[preserve none]
 
-      raise ArgumentError, "Transfer expiration policy must be one of: #{allowed_values.join(', ')}" unless allowed_values.include?(normalized_value)
+      raise ArgumentError, "Transfer expiration policy must be one of: #{allowed_values.join(", ")}" unless allowed_values.include?(normalized_value)
 
       @transfer_expiration_policy = normalized_value
     end

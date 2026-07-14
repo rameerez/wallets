@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module Wallets
-  # Transactions are the append-only source of truth for wallet balance changes.
+  # Transactions are the source of truth for wallet balance changes.
   # Positive rows add value, negative rows consume value, and transfers link both
   # sides of an internal movement through `transfer_id`.
   #
@@ -43,28 +43,31 @@ module Wallets
     belongs_to :transfer, class_name: "Wallets::Transfer", optional: true
 
     has_many :outgoing_allocations,
-             class_name: "Wallets::Allocation",
-             foreign_key: :transaction_id,
-             dependent: :destroy
+      class_name: "Wallets::Allocation",
+      foreign_key: :transaction_id,
+      dependent: :destroy
 
     has_many :incoming_allocations,
-             class_name: "Wallets::Allocation",
-             foreign_key: :source_transaction_id,
-             dependent: :destroy
+      class_name: "Wallets::Allocation",
+      foreign_key: :source_transaction_id,
+      dependent: :destroy
 
-    validates :amount, presence: true, numericality: { only_integer: true }
-    validates :category, presence: true, inclusion: { in: ->(record) { record.class.categories } }
+    validates :amount, presence: true, numericality: {only_integer: true, other_than: 0}
+    validates :category, presence: true, inclusion: {in: ->(record) { record.class.categories }}
     validate :remaining_amount_cannot_be_negative
 
-    scope :credits, -> { where("amount > 0") }
-    scope :debits, -> { where("amount < 0") }
+    # Qualify predicates through Arel so these scopes remain composable when a
+    # joined table also has `amount` / `expires_at` columns (transfers do).
+    # `arel_table` also respects embedded subclasses' custom table names.
+    scope :credits, -> { where(arel_table[:amount].gt(0)) }
+    scope :debits, -> { where(arel_table[:amount].lt(0)) }
     scope :recent, -> { order(created_at: :desc) }
     scope :by_category, ->(category) { where(category: category) }
     # `not_expired` and `expired` partition all transactions at any instant:
     # a transaction expiring exactly "now" is already expired, matching the
     # balance math, which only counts buckets that are strictly still alive.
-    scope :not_expired, -> { where("expires_at IS NULL OR expires_at > ?", Time.current) }
-    scope :expired, -> { where("expires_at <= ?", Time.current) }
+    scope :not_expired, -> { where(arel_table[:expires_at].eq(nil).or(arel_table[:expires_at].gt(Time.current))) }
+    scope :expired, -> { where(arel_table[:expires_at].lteq(Time.current)) }
 
     def owner
       wallet.owner
@@ -75,11 +78,11 @@ module Wallets
     end
 
     def credit?
-      amount.positive?
+      amount.to_i.positive?
     end
 
     def debit?
-      amount.negative?
+      amount.to_i.negative?
     end
 
     def allocated_amount

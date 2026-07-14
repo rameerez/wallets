@@ -40,9 +40,9 @@ module Wallets
 
     included do
       has_many :wallets,
-               class_name: "Wallets::Wallet",
-               as: :owner,
-               dependent: :destroy
+        class_name: "Wallets::Wallet",
+        as: :owner,
+        dependent: :destroy
 
       after_create :create_main_wallet, if: :should_auto_create_wallet?
     end

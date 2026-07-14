@@ -3,7 +3,7 @@
 module Wallets
   # A transfer records an internal movement of value between two wallets of the
   # same asset. The actual balance impact lives in the linked transactions on
-  # each side so the ledger remains append-only.
+  # each side so the transaction history remains explicit.
   #
   # Transfers keep the outbound leg singular and the inbound legs plural so the
   # receiver can preserve the sender's expiration buckets when one transfer
@@ -32,15 +32,15 @@ module Wallets
     # is cleared. The transaction metadata still carries `transfer_id` and the
     # counterparty details for audit purposes.
     has_many :transactions,
-             class_name: "Wallets::Transaction",
-             foreign_key: :transfer_id,
-             inverse_of: :transfer,
-             dependent: :nullify
+      class_name: "Wallets::Transaction",
+      foreign_key: :transfer_id,
+      inverse_of: :transfer,
+      dependent: :nullify
 
     validates :asset_code, presence: true
-    validates :amount, presence: true, numericality: { only_integer: true, greater_than: 0 }
+    validates :amount, presence: true, numericality: {only_integer: true, greater_than: 0}
     validates :category, presence: true
-    validates :expiration_policy, presence: true, inclusion: { in: SUPPORTED_EXPIRATION_POLICIES }
+    validates :expiration_policy, presence: true, inclusion: {in: SUPPORTED_EXPIRATION_POLICIES}
     validate :wallets_must_differ
     validate :wallet_assets_match_transfer_asset
 

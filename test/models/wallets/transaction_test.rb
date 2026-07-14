@@ -36,6 +36,18 @@ class Wallets::TransactionTest < ActiveSupport::TestCase
     assert_not wallets_transactions(:rich_purchase).credit?
   end
 
+  test "zero amounts are invalid and nil amount predicates are safe" do
+    wallet = wallets_wallets(:rich_coins_wallet)
+    zero = Wallets::Transaction.new(wallet: wallet, amount: 0, category: "credit")
+    missing = Wallets::Transaction.new(wallet: wallet, category: "credit")
+
+    assert_not zero.valid?
+    assert_includes zero.errors[:amount], "must be other than 0"
+    assert_not missing.credit?
+    assert_not missing.debit?
+    assert_not missing.valid?
+  end
+
   test "expired reflects expires_at" do
     assert wallets_transactions(:rich_expired_reward).expired?
     assert_not wallets_transactions(:rich_future_reward).expired?
@@ -108,6 +120,23 @@ class Wallets::TransactionTest < ActiveSupport::TestCase
     assert_equal [spend.id], wallet.transactions.debits.pluck(:id)
     assert_equal [spend.id], wallet.transactions.by_category(:purchase).pluck(:id)
     assert_equal [spend.id, seed.id], wallet.transactions.recent.pluck(:id)
+  end
+
+  test "amount and expiration scopes remain unambiguous when transfers are joined" do
+    sender = create_wallet(users(:new_user), asset_code: :joined_scope, initial_balance: 100)
+    recipient = create_wallet(users(:peer_user), asset_code: :joined_scope)
+    transfer = sender.transfer_to(recipient, 25, category: :peer_payment)
+
+    assert_equal transfer.outbound_transaction, sender.transactions.joins(:transfer).debits.sole
+    assert_equal transfer.inbound_transaction, recipient.transactions.joins(:transfer).credits.sole
+
+    table = Wallets::Transaction.table_name
+    connection = Wallets::Transaction.connection
+    qualified = ->(column) { "#{connection.quote_table_name(table)}.#{connection.quote_column_name(column)}" }
+    assert_includes Wallets::Transaction.credits.to_sql, qualified.call(:amount)
+    assert_includes Wallets::Transaction.debits.to_sql, qualified.call(:amount)
+    assert_includes Wallets::Transaction.not_expired.to_sql, qualified.call(:expires_at)
+    assert_includes Wallets::Transaction.expired.to_sql, qualified.call(:expires_at)
   end
 
   # ───────────────────────────────────────────────────────────────────────────
@@ -184,7 +213,7 @@ class Wallets::TransactionTest < ActiveSupport::TestCase
     transaction.metadata = nil
     assert_equal({}, transaction.metadata)
 
-    transaction.metadata = { "a" => 1 }
+    transaction.metadata = {"a" => 1}
     assert_equal 1, transaction.metadata[:a]
   end
 

@@ -5,7 +5,7 @@ module Wallets
   #
   # Balances are not maintained by incrementing a counter in place. Instead, the
   # wallet derives its current balance from transactions and allocations so it
-  # can support FIFO consumption, expirations, transfers, and a durable audit
+  # can support expiration-aware consumption, transfers, and a durable audit
   # trail at the same time.
   #
   # This class supports embedding: subclasses can override config, callbacks,
@@ -14,6 +14,11 @@ module Wallets
   class Wallet < ApplicationRecord
     include Wallets::Embeddable
     include Wallets::HasMetadata
+
+    CORE_TRANSACTION_ATTRIBUTE_NAMES = %i[
+      id wallet wallet_id amount category expires_at metadata transfer
+      transfer_id balance_before balance_after created_at updated_at
+    ].freeze
 
     self.table_suffix = "wallets"
 
@@ -25,6 +30,11 @@ module Wallets
     class_attribute :transaction_class_name, default: "Wallets::Transaction"
     class_attribute :allocation_class_name, default: "Wallets::Allocation"
     class_attribute :transfer_class_name, default: "Wallets::Transfer"
+    # Embedded ledgers may add their own transaction columns (for example,
+    # usage_credits adds `fulfillment_id`). Keeping an explicit allowlist
+    # prevents arbitrary keyword attributes from overriding accounting fields
+    # such as amount, wallet, category, metadata, or timestamps.
+    class_attribute :additional_transaction_attribute_names, default: [].freeze
     class_attribute :callback_event_map, default: {
       credited: :balance_credited,
       debited: :balance_debited,
@@ -57,19 +67,19 @@ module Wallets
 
     has_many :transactions, class_name: "Wallets::Transaction", dependent: :destroy
     has_many :outgoing_transfers,
-             class_name: "Wallets::Transfer",
-             foreign_key: :from_wallet_id,
-             dependent: :destroy,
-             inverse_of: :from_wallet
+      class_name: "Wallets::Transfer",
+      foreign_key: :from_wallet_id,
+      dependent: :destroy,
+      inverse_of: :from_wallet
     has_many :incoming_transfers,
-             class_name: "Wallets::Transfer",
-             foreign_key: :to_wallet_id,
-             dependent: :destroy,
-             inverse_of: :to_wallet
+      class_name: "Wallets::Transfer",
+      foreign_key: :to_wallet_id,
+      dependent: :destroy,
+      inverse_of: :to_wallet
 
-    validates :asset_code, presence: true, uniqueness: { scope: [:owner_type, :owner_id] }
-    validates :balance, numericality: { only_integer: true }
-    validates :balance, numericality: { greater_than_or_equal_to: 0 }, unless: :allow_negative_balance?
+    validates :asset_code, presence: true, uniqueness: {scope: [:owner_type, :owner_id]}
+    validates :balance, numericality: {only_integer: true}
+    validates :balance, numericality: {greater_than_or_equal_to: 0}, unless: :allow_negative_balance?
 
     before_validation :normalize_asset_code!
 
@@ -118,17 +128,14 @@ module Wallets
       def initial_balance_credit_attributes
         {
           category: :adjustment,
-          metadata: { reason: "initial_balance" }
+          metadata: {reason: "initial_balance"}
         }
       end
 
       def normalize_initial_balance(value)
         return 0 if value.nil?
 
-        whole = (value == value.to_i rescue false)
-        raise ArgumentError, "Initial balance must be a whole number" unless whole
-
-        value = value.to_i
+        value = Wallets::WholeNumber.parse(value, name: "Initial balance")
         raise ArgumentError, "Initial balance cannot be negative" if value.negative?
 
         value
@@ -174,6 +181,7 @@ module Wallets
 
     def credit(amount, metadata: {}, category: :credit, expires_at: nil, transfer: nil, **extra_transaction_attributes)
       metadata = normalize_metadata(metadata)
+      extra_transaction_attributes = validate_additional_transaction_attributes!(extra_transaction_attributes)
 
       with_lock do
         apply_credit(
@@ -189,6 +197,7 @@ module Wallets
 
     def debit(amount, metadata: {}, category: :debit, transfer: nil, **extra_transaction_attributes)
       metadata = normalize_metadata(metadata)
+      extra_transaction_attributes = validate_additional_transaction_attributes!(extra_transaction_attributes)
 
       with_lock do
         apply_debit(
@@ -211,7 +220,7 @@ module Wallets
       raise InvalidTransfer, "Target wallet must be persisted" unless other_wallet.persisted?
       raise InvalidTransfer, "Cannot transfer to the same wallet" if other_wallet.id == id
       raise InvalidTransfer, "Wallet assets must match" unless asset_code == other_wallet.asset_code
-      raise InvalidTransfer, "Wallet classes must match" unless other_wallet.class == self.class
+      raise InvalidTransfer, "Wallet classes must match" unless other_wallet.instance_of?(self.class)
 
       amount = normalize_positive_amount!(amount)
       metadata = normalize_metadata(metadata)
@@ -319,8 +328,7 @@ module Wallets
           transfer: transfer,
           amount: amount,
           category: category,
-          metadata: metadata
-        )
+          metadata: metadata)
 
         transfer
       end
@@ -360,7 +368,18 @@ module Wallets
       event = self.class.callback_event_map[kind]
       return if event.nil?
 
-      callbacks.dispatch(event, **data)
+      callback_dispatcher = callbacks
+      dispatch = -> { callback_dispatcher.dispatch(event, **data) }
+
+      # Successful ledger callbacks describe committed facts. Deferring them
+      # through the outermost transaction prevents notifications/jobs for rows
+      # that a caller later rolls back. Failure callbacks are intentionally
+      # immediate because their transaction is about to roll back by design.
+      if kind == :insufficient || !ActiveRecord.respond_to?(:after_all_transactions_commit)
+        dispatch.call
+      else
+        ActiveRecord.after_all_transactions_commit(&dispatch)
+      end
     end
 
     # =========================================
@@ -393,17 +412,16 @@ module Wallets
         transaction: transaction,
         previous_balance: previous_balance,
         new_balance: balance,
-        metadata: metadata
-      )
+        metadata: metadata)
 
       transaction
     end
 
-    def apply_debit(amount, metadata:, category:, transfer:, extra_attributes: {})
+    def apply_debit(amount, metadata:, category:, transfer:, extra_attributes: {}, allow_unbacked: allow_negative_balance?)
       amount = normalize_positive_amount!(amount)
       previous_balance = balance
 
-      if amount > previous_balance && !allow_negative_balance?
+      if amount > previous_balance && !allow_unbacked
         dispatch_insufficient_balance!(amount, previous_balance, metadata)
         raise InsufficientBalance, "Insufficient balance (#{previous_balance} < #{amount})"
       end
@@ -419,7 +437,7 @@ module Wallets
 
       remaining_to_allocate = allocate_debit!(spend_transaction, amount)
 
-      if remaining_to_allocate.positive? && !allow_negative_balance?
+      if remaining_to_allocate.positive? && !allow_unbacked
         raise InsufficientBalance, "Not enough balance buckets to cover the debit"
       end
 
@@ -433,8 +451,7 @@ module Wallets
         transaction: spend_transaction,
         previous_balance: previous_balance,
         new_balance: balance,
-        metadata: metadata
-      )
+        metadata: metadata)
 
       dispatch_balance_threshold_callbacks!(previous_balance)
 
@@ -513,9 +530,9 @@ module Wallets
     def build_transfer_inbound_credit_specs(transfer:, outbound_transaction:, amount:, expiration_policy:, expires_at:)
       case expiration_policy
       when "none"
-        [{ amount: amount, expires_at: nil }]
+        [{amount: amount, expires_at: nil}]
       when "fixed"
-        [{ amount: amount, expires_at: expires_at }]
+        [{amount: amount, expires_at: expires_at}]
       when "preserve"
         build_preserved_transfer_inbound_credit_specs(transfer, outbound_transaction, amount)
       else
@@ -533,7 +550,7 @@ module Wallets
         if grouped_specs.last && grouped_specs.last[:expires_at] == expires_at
           grouped_specs.last[:amount] += allocation.amount
         else
-          grouped_specs << { amount: allocation.amount, expires_at: expires_at }
+          grouped_specs << {amount: allocation.amount, expires_at: expires_at}
         end
       end
 
@@ -550,23 +567,30 @@ module Wallets
     # =========================================
 
     def positive_remaining_balance
-      txn_table = transaction_class.table_name
-      alloc_table = allocation_class.table_name
+      connection = transaction_class.connection
+      txn_table = connection.quote_table_name(transaction_class.table_name)
+      alloc_table = connection.quote_table_name(allocation_class.table_name)
+      amount_column = connection.quote_column_name("amount")
+      id_column = connection.quote_column_name("id")
+      source_transaction_id_column = connection.quote_column_name("source_transaction_id")
 
       transactions
         .credits
         .not_expired
-        .sum("amount - (SELECT COALESCE(SUM(amount), 0) FROM #{alloc_table} WHERE source_transaction_id = #{txn_table}.id)")
+        .sum("#{txn_table}.#{amount_column} - (SELECT COALESCE(SUM(#{amount_column}), 0) FROM #{alloc_table} WHERE #{source_transaction_id_column} = #{txn_table}.#{id_column})")
         .to_i
     end
 
-    def unbacked_negative_balance
-      txn_table = transaction_class.table_name
-      alloc_table = allocation_class.table_name
+    def unbacked_negative_balance(transaction_scope = transactions.debits)
+      connection = transaction_class.connection
+      txn_table = connection.quote_table_name(transaction_class.table_name)
+      alloc_table = connection.quote_table_name(allocation_class.table_name)
+      amount_column = connection.quote_column_name("amount")
+      id_column = connection.quote_column_name("id")
+      transaction_id_column = connection.quote_column_name("transaction_id")
 
-      transactions
-        .debits
-        .sum("ABS(amount) - (SELECT COALESCE(SUM(amount), 0) FROM #{alloc_table} WHERE transaction_id = #{txn_table}.id)")
+      transaction_scope
+        .sum("ABS(#{txn_table}.#{amount_column}) - (SELECT COALESCE(SUM(#{amount_column}), 0) FROM #{alloc_table} WHERE #{transaction_id_column} = #{txn_table}.#{id_column})")
         .to_i
     end
 
@@ -588,8 +612,7 @@ module Wallets
         metadata: metadata.merge(
           available: previous_balance,
           required: amount
-        )
-      )
+        ))
     end
 
     def dispatch_balance_threshold_callbacks!(previous_balance)
@@ -598,8 +621,7 @@ module Wallets
           wallet: self,
           threshold: config.low_balance_threshold,
           previous_balance: previous_balance,
-          new_balance: balance
-        )
+          new_balance: balance)
       end
 
       # `:balance_depleted` fires when the wallet crosses from a positive
@@ -616,8 +638,7 @@ module Wallets
         dispatch_callback(:depleted,
           wallet: self,
           previous_balance: previous_balance,
-          new_balance: balance
-        )
+          new_balance: balance)
       end
     end
 
@@ -649,7 +670,7 @@ module Wallets
 
       expiration = begin
         expires_at.to_datetime
-      rescue StandardError
+      rescue
         raise ArgumentError, "Expiration date must be a valid date or time"
       end
 
@@ -659,10 +680,7 @@ module Wallets
     def normalize_positive_amount!(amount)
       raise ArgumentError, "Amount is required" if amount.nil?
 
-      whole = (amount == amount.to_i rescue false)
-      raise ArgumentError, "Amount must be a whole number" unless whole
-
-      amount = amount.to_i
+      amount = Wallets::WholeNumber.parse(amount, name: "Amount")
       raise ArgumentError, "Amount must be positive" unless amount.positive?
 
       amount
@@ -670,6 +688,15 @@ module Wallets
 
     def normalize_metadata(metadata)
       metadata.respond_to?(:to_h) ? metadata.to_h : {}
+    end
+
+    def validate_additional_transaction_attributes!(attributes)
+      allowed = self.class.additional_transaction_attribute_names.map(&:to_sym)
+      requested = attributes.keys.map(&:to_sym)
+      unsupported = (requested - allowed) | (requested & CORE_TRANSACTION_ATTRIBUTE_NAMES)
+      return attributes if unsupported.empty?
+
+      raise ArgumentError, "Unsupported transaction attributes: #{unsupported.join(", ")}"
     end
 
     def lock_wallet_pair!(other_wallet)

@@ -12,7 +12,7 @@ class Wallets::WalletTest < ActiveSupport::TestCase
   test "credit creates a transaction and updates balance snapshots" do
     wallet = wallets_wallets(:rich_coins_wallet)
 
-    transaction = wallet.credit(75, category: :reward, metadata: { source: "promo" })
+    transaction = wallet.credit(75, category: :reward, metadata: {source: "promo"})
 
     assert_equal 75, transaction.amount
     assert_equal 1000, transaction.balance_before
@@ -20,13 +20,30 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     assert_equal 1075, wallet.reload.balance
   end
 
+  test "public transaction keywords cannot override ledger accounting fields" do
+    wallet = create_wallet(users(:new_user), asset_code: :protected_attributes, initial_balance: 100)
+
+    error = assert_raises(ArgumentError) do
+      wallet.credit(10, amount: -1_000, category: :reward)
+    end
+    assert_includes error.message, "Unsupported transaction attributes: amount"
+
+    error = assert_raises(ArgumentError) do
+      wallet.debit(10, created_at: 10.years.ago, category: :purchase)
+    end
+    assert_includes error.message, "Unsupported transaction attributes: created_at"
+
+    assert_equal 100, wallet.reload.balance
+    assert_equal 1, wallet.transactions.count
+  end
+
   test "debit allocates from the oldest available transactions first" do
     wallet = create_wallet(users(:new_user), asset_code: :wood, initial_balance: 0)
 
-    oldest = wallet.credit(100, category: :top_up, metadata: { bucket: "oldest" })
-    newer = wallet.credit(80, category: :reward, metadata: { bucket: "newer" })
+    oldest = wallet.credit(100, category: :top_up, metadata: {bucket: "oldest"})
+    newer = wallet.credit(80, category: :reward, metadata: {bucket: "newer"})
 
-    spend = wallet.debit(130, category: :purchase, metadata: { sku: "bundle" })
+    spend = wallet.debit(130, category: :purchase, metadata: {sku: "bundle"})
     allocations = spend.outgoing_allocations.order(:id)
 
     assert_equal oldest.id, allocations.first.source_transaction_id
@@ -431,7 +448,7 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     wallet = Wallets::Wallet.create_for_owner!(
       owner: users(:new_user),
       asset_code: " EUR ",
-      metadata: { "tier" => "vip" }
+      metadata: {"tier" => "vip"}
     )
 
     assert_equal "eur", wallet.asset_code
@@ -496,7 +513,7 @@ class Wallets::WalletTest < ActiveSupport::TestCase
   end
 
   test "wallet metadata reads with indifferent access and mutations survive save" do
-    wallet = Wallets::Wallet.create_for_owner!(owner: users(:new_user), asset_code: :meta, metadata: { "tier" => "vip" })
+    wallet = Wallets::Wallet.create_for_owner!(owner: users(:new_user), asset_code: :meta, metadata: {"tier" => "vip"})
 
     assert_equal "vip", wallet.metadata[:tier]
 

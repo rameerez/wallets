@@ -9,7 +9,7 @@ class Wallets::CallbackContextTest < ActiveSupport::TestCase
       event: :balance_credited,
       wallet: wallet,
       amount: 25,
-      metadata: { source: "test" }
+      metadata: {source: "test"}
     )
 
     assert_equal wallet.owner, context.owner
@@ -18,7 +18,7 @@ class Wallets::CallbackContextTest < ActiveSupport::TestCase
         event: :balance_credited,
         wallet: wallet,
         amount: 25,
-        metadata: { source: "test" }
+        metadata: {source: "test"}
       },
       context.to_h
     )
@@ -28,6 +28,6 @@ class Wallets::CallbackContextTest < ActiveSupport::TestCase
     context = Wallets::CallbackContext.new(event: :balance_credited)
 
     assert_nil context.owner
-    assert_equal({ event: :balance_credited }, context.to_h)
+    assert_equal({event: :balance_credited}, context.to_h)
   end
 end

@@ -5,8 +5,10 @@ require "active_record"
 require "active_support/all"
 
 require "wallets/version"
+require "wallets/whole_number"
 require "wallets/configuration"
 require "wallets/callback_context"
+require "wallets/callback_dispatcher"
 require "wallets/callbacks"
 
 module Wallets

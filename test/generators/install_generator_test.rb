@@ -50,6 +50,14 @@ class Wallets::InstallGeneratorTest < Rails::Generators::TestCase
         tables.each { |table| assert connection.data_source_exists?(table), "expected #{table} to be created" }
         assert connection.indexes("gencheck_transactions").any?, "expected indexes on gencheck_transactions"
         assert connection.indexes("gencheck_transfers").any?, "expected indexes on gencheck_transfers"
+        assert connection.check_constraint_exists?(
+          "gencheck_transactions",
+          name: "check_gencheck_transactions_amount_nonzero"
+        )
+        assert connection.check_constraint_exists?(
+          "gencheck_allocations",
+          name: "check_gencheck_allocations_amount_positive"
+        )
 
         migration.migrate(:down)
         tables.each { |table| refute connection.data_source_exists?(table), "expected #{table} to be dropped" }

@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.3.0] - Unreleased
 
 ### Fixed
 
@@ -22,18 +22,25 @@
 - `transfer_to` opens its transaction via the wallet class (`self.class.transaction`) instead of `ActiveRecord::Base.transaction`, so embedded wallet subclasses connected to a different database transact on the right connection.
 - `Wallets::Railtie` is retained as a compatibility alias for `Wallets::Engine`; the engine remains the actual Rails integration point.
 - `Wallets::Transfer` now validates `category` presence at the model layer instead of failing with a database `NOT NULL` violation.
+- Successful lifecycle callbacks run only after the caller's outermost database transaction commits; a later rollback now drops them entirely. Rails 7.2's callback API is required for this guarantee.
+- Ruby 3.2 and Rails 7.2.3.1 are now the minimum supported runtime versions. Current security-patched Rails dependency releases cannot be installed on Ruby 3.1, and earlier Rails 7.2 patch releases contain known vulnerabilities.
+- Expiring value is consumed first (FEFO), with oldest-first ordering as the deterministic tie-breaker. Documentation now names this behavior accurately instead of calling every allocation FIFO.
 
 ### Added
 
 - `Wallets.normalize_asset_code(value)` — the single source of truth for asset code normalization (`" EUR "`, `:EUR`, and `"eur"` all name the same wallet), used consistently across configuration, wallets, transfers, and owner lookups.
 - `Wallets::Embeddable` concern — the embeddability plumbing (`embedded_table_name`, `config_provider`, `resolved_config`, prefix-derived table names) extracted from the four models into one place. Embedded subclasses without an explicit `embedded_table_name` derive `"#{config.table_prefix}#{table_suffix}"` automatically.
 - `Wallets::HasMetadata` concern — the indifferent-access metadata behavior (hash coercion, mutation-safe saves, NULL-column healing for MySQL) extracted from the three metadata-carrying models into one place.
+- `Wallets::WholeNumber` — one strict integer parser shared by the core ledger and embedding gems, eliminating silent float/string truncation across amount and threshold boundaries.
+- An explicit transaction-attribute allowlist for embedded ledgers, preventing extension keywords from overwriting core accounting fields.
 
 ### Tests
 
-- Test suite grew from 92 runs / 338 assertions to 188 runs / 670 assertions. Line coverage 93.45% → 100%, branch coverage 65.93% → 98.8%; the SimpleCov gate is raised to 98% line / 85% branch.
-- New regression tests for every fix above, including a real duplicate-insert race executed inside a caller's transaction (exercises PostgreSQL savepoint semantics in CI), destroy cascades with transfer history, FIFO expiring-first allocation order, expiration boundary partitioning, amount/expiration edge cases, callback logging fallbacks, and STI wallet-option inheritance.
+- Test suite grew from 92 runs / 338 assertions to 200 runs / 741 assertions. Line coverage 93.45% → 100%, branch coverage 65.93% → 98.91%; the SimpleCov gate is raised to 98% line / 85% branch.
+- New regression tests for every fix above, including a real duplicate-insert race executed inside a caller's transaction (exercises PostgreSQL savepoint semantics in CI), destroy cascades with transfer history, FEFO allocation order, expiration boundary partitioning, amount/expiration edge cases, callback logging fallbacks, and STI wallet-option inheritance.
 - The install generator now runs in tests, and its generated migration is executed (up and down) against the real database adapter in CI.
+- Compatibility coverage includes Ruby 3.2 across both the Rails 7.2 and Rails 8.1 boundaries, Ruby 3.3/3.4/4.0 across both Rails lines, and clean migrations plus the full suite on SQLite, PostgreSQL, and MySQL.
+- CI audits every supported dependency bundle against the latest `ruby-advisory-db` before release.
 
 ## [0.2.0] - 2026-05-03
 

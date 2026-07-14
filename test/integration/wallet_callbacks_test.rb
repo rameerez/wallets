@@ -136,8 +136,8 @@ class WalletCallbacksTest < ActiveSupport::TestCase
     wallet.debit(60, category: :purchase)  # 30 → -30, fires (2)
 
     assert_equal 2, events.size, "depleted fires once per fresh crossing of the positive→non-positive boundary"
-    assert_equal [ 100, 30 ], events.map(&:previous_balance)
-    assert_equal [ -50, -30 ], events.map(&:new_balance)
+    assert_equal [100, 30], events.map(&:previous_balance)
+    assert_equal [-50, -30], events.map(&:new_balance)
   end
 
   test "balance_depleted does not fire when a debit lands a wallet that was already non-positive" do
@@ -227,6 +227,20 @@ class WalletCallbacksTest < ActiveSupport::TestCase
     completed_context = events[2].last
     assert_equal transfer.id, completed_context.transfer.id
     assert_equal 50, completed_context.amount
+  end
+
+  test "successful callbacks are discarded when an enclosing transaction rolls back" do
+    events = []
+    Wallets.configuration.on_balance_credited { |ctx| events << ctx }
+    wallet = wallets_wallets(:rich_coins_wallet)
+
+    Wallets::Wallet.transaction do
+      wallet.credit(25, category: :reward)
+      raise ActiveRecord::Rollback
+    end
+
+    assert_empty events
+    assert_equal 1000, wallet.reload.balance
   end
 
   test "transfer legs record balance snapshots on both wallets" do

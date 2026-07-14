@@ -94,6 +94,14 @@ class Wallets::ConfigurationTest < ActiveSupport::TestCase
     assert_raises(ArgumentError) { configuration.low_balance_threshold = "abc" }
   end
 
+  test "low_balance_threshold rejects fractional and non-finite values" do
+    configuration = Wallets::Configuration.new
+
+    [1.5, Float::INFINITY].each do |value|
+      assert_raises(ArgumentError) { configuration.low_balance_threshold = value }
+    end
+  end
+
   test "default_asset accepts symbols and normalizes case" do
     configuration = Wallets::Configuration.new
 
