@@ -1,24 +1,25 @@
 # frozen_string_literal: true
 
 module Wallets
-  # Transactions are the append-only source of truth for wallet balance changes.
+  # Transactions are the source of truth for wallet balance changes.
   # Positive rows add value, negative rows consume value, and transfers link both
   # sides of an internal movement through `transfer_id`.
   #
   # This class supports embedding: subclasses can override config and table
   # names without affecting the base Wallets::* behavior.
-  class Transaction < ApplicationRecord
-    class_attribute :embedded_table_name, default: nil
-    class_attribute :config_provider, default: -> { Wallets.configuration }
+  class TransactionBase < ApplicationRecord
+    # Abstract on purpose: embedders (like usage_credits) subclass THIS
+    # class, not the concrete Transaction below. ActiveRecord builds a
+    # subclass's attribute methods on its parent's, so a concrete parent
+    # forces a schema load of the wallets_* tables — which do not exist in
+    # apps that only run an embedded ledger (fresh usage_credits installs).
+    # An abstract parent makes each embedded subclass its own base_class
+    # and keeps the base tables out of the picture entirely.
+    self.abstract_class = true
+    include Wallets::Embeddable
+    include Wallets::HasMetadata
 
-    def self.table_name
-      embedded_table_name || "#{resolved_config.table_prefix}transactions"
-    end
-
-    def self.resolved_config
-      value = config_provider
-      value.respond_to?(:call) ? value.call : value
-    end
+    self.table_suffix = "transactions"
 
     DEFAULT_CATEGORIES = [
       "credit",
@@ -44,60 +45,52 @@ module Wallets
       (DEFAULT_CATEGORIES + extra_categories).uniq
     end
 
-    belongs_to :wallet, class_name: "Wallets::Wallet"
+    # Explicit `optional:` flags because the gem's models load before Rails
+    # applies `belongs_to_required_by_default`.
+    belongs_to :wallet, class_name: "Wallets::Wallet", optional: false
     belongs_to :transfer, class_name: "Wallets::Transfer", optional: true
 
     has_many :outgoing_allocations,
-             class_name: "Wallets::Allocation",
-             foreign_key: :transaction_id,
-             dependent: :destroy
+      class_name: "Wallets::Allocation",
+      foreign_key: :transaction_id,
+      dependent: :destroy
 
     has_many :incoming_allocations,
-             class_name: "Wallets::Allocation",
-             foreign_key: :source_transaction_id,
-             dependent: :destroy
+      class_name: "Wallets::Allocation",
+      foreign_key: :source_transaction_id,
+      dependent: :destroy
 
-    validates :amount, presence: true, numericality: { only_integer: true }
-    validates :category, presence: true, inclusion: { in: ->(record) { record.class.categories } }
+    validates :amount, presence: true, numericality: {only_integer: true, other_than: 0}
+    validates :category, presence: true, inclusion: {in: ->(record) { record.class.categories }}
     validate :remaining_amount_cannot_be_negative
 
-    before_save :sync_metadata_cache
-
-    scope :credits, -> { where("amount > 0") }
-    scope :debits, -> { where("amount < 0") }
+    # Qualify predicates through Arel so these scopes remain composable when a
+    # joined table also has `amount` / `expires_at` columns (transfers do).
+    # `arel_table` also respects embedded subclasses' custom table names.
+    scope :credits, -> { where(arel_table[:amount].gt(0)) }
+    scope :debits, -> { where(arel_table[:amount].lt(0)) }
     scope :recent, -> { order(created_at: :desc) }
     scope :by_category, ->(category) { where(category: category) }
-    scope :not_expired, -> { where("expires_at IS NULL OR expires_at > ?", Time.current) }
-    scope :expired, -> { where("expires_at < ?", Time.current) }
-
-    def metadata
-      @indifferent_metadata ||= ActiveSupport::HashWithIndifferentAccess.new(super || {})
-    end
-
-    def metadata=(hash)
-      @indifferent_metadata = nil
-      super(hash.respond_to?(:to_h) ? hash.to_h : {})
-    end
-
-    def reload(*)
-      @indifferent_metadata = nil
-      super
-    end
+    # `not_expired` and `expired` partition all transactions at any instant:
+    # a transaction expiring exactly "now" is already expired, matching the
+    # balance math, which only counts buckets that are strictly still alive.
+    scope :not_expired, -> { where(arel_table[:expires_at].eq(nil).or(arel_table[:expires_at].gt(Time.current))) }
+    scope :expired, -> { where(arel_table[:expires_at].lteq(Time.current)) }
 
     def owner
       wallet.owner
     end
 
     def expired?
-      expires_at.present? && expires_at < Time.current
+      expires_at.present? && expires_at <= Time.current
     end
 
     def credit?
-      amount.positive?
+      amount.to_i.positive?
     end
 
     def debit?
-      amount.negative?
+      amount.to_i.negative?
     end
 
     def allocated_amount
@@ -137,18 +130,15 @@ module Wallets
 
     private
 
-    def sync_metadata_cache
-      if @indifferent_metadata
-        write_attribute(:metadata, @indifferent_metadata.to_h)
-      elsif read_attribute(:metadata).nil?
-        write_attribute(:metadata, {})
-      end
-    end
-
     def remaining_amount_cannot_be_negative
       if credit? && remaining_amount.negative?
         errors.add(:base, "Allocated amount exceeds transaction amount")
       end
     end
+  end
+
+  # The concrete standalone ledger model (table: wallets_transactions via the
+  # default config). Embedders subclass TransactionBase instead.
+  class Transaction < TransactionBase
   end
 end

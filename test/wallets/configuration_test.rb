@@ -81,4 +81,42 @@ class Wallets::ConfigurationTest < ActiveSupport::TestCase
     assert_equal depleted, configuration.on_balance_depleted_callback
     assert_equal insufficient, configuration.on_insufficient_balance_callback
   end
+
+  test "low_balance_threshold accepts zero, nil, and numeric strings" do
+    configuration = Wallets::Configuration.new
+
+    configuration.low_balance_threshold = 0
+    assert_equal 0, configuration.low_balance_threshold
+
+    configuration.low_balance_threshold = nil
+    assert_nil configuration.low_balance_threshold
+
+    assert_raises(ArgumentError) { configuration.low_balance_threshold = "abc" }
+  end
+
+  test "low_balance_threshold rejects fractional and non-finite values" do
+    configuration = Wallets::Configuration.new
+
+    [1.5, Float::INFINITY].each do |value|
+      assert_raises(ArgumentError) { configuration.low_balance_threshold = value }
+    end
+  end
+
+  test "default_asset accepts symbols and normalizes case" do
+    configuration = Wallets::Configuration.new
+
+    configuration.default_asset = :GEMS
+
+    assert_equal :gems, configuration.default_asset
+    assert_raises(ArgumentError) { configuration.default_asset = nil }
+  end
+
+  test "transfer_expiration_policy normalizes strings and rejects unknown values" do
+    configuration = Wallets::Configuration.new
+
+    configuration.transfer_expiration_policy = "  PRESERVE "
+
+    assert_equal :preserve, configuration.transfer_expiration_policy
+    assert_raises(ArgumentError) { configuration.transfer_expiration_policy = :forever }
+  end
 end

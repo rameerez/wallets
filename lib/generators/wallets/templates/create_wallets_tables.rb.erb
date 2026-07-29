@@ -38,7 +38,7 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
       t.timestamps
     end
 
-    # Allocations are the basis for the bucket-based, FIFO inventory system.
+    # Allocations are the basis for the bucket-based, first-expiring-first-out inventory system.
     create_table allocations_table, id: primary_key_type do |t|
       # The negative spend transaction that is consuming value.
       t.references :transaction, null: false, type: foreign_key_type,
@@ -54,6 +54,19 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
 
       t.timestamps
     end
+
+    add_check_constraint transfers_table,
+                         "amount > 0",
+                         name: constraint_name("transfers_amount_positive")
+    add_check_constraint transfers_table,
+                         "from_wallet_id <> to_wallet_id",
+                         name: constraint_name("transfers_distinct_wallets")
+    add_check_constraint transactions_table,
+                         "amount <> 0",
+                         name: constraint_name("transactions_amount_nonzero")
+    add_check_constraint allocations_table,
+                         "amount > 0",
+                         name: constraint_name("allocations_amount_positive")
 
     add_index transactions_table, :category
     add_index transactions_table, :expires_at
@@ -109,5 +122,9 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
 
   def index_name(suffix)
     "index_#{table_prefix}#{suffix}"
+  end
+
+  def constraint_name(suffix)
+    "check_#{table_prefix}#{suffix}"
   end
 end
