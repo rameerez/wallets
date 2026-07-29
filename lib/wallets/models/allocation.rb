@@ -7,7 +7,15 @@ module Wallets
   #
   # This class supports embedding: subclasses can override config and table
   # names without affecting the base Wallets::* behavior.
-  class Allocation < ApplicationRecord
+  class AllocationBase < ApplicationRecord
+    # Abstract on purpose: embedders (like usage_credits) subclass THIS
+    # class, not the concrete Allocation below. ActiveRecord builds a
+    # subclass's attribute methods on its parent's, so a concrete parent
+    # forces a schema load of the wallets_* tables — which do not exist in
+    # apps that only run an embedded ledger (fresh usage_credits installs).
+    # An abstract parent makes each embedded subclass its own base_class
+    # and keeps the base tables out of the picture entirely.
+    self.abstract_class = true
     include Wallets::Embeddable
 
     self.table_suffix = "allocations"
@@ -62,5 +70,10 @@ module Wallets
         errors.add(:amount, "exceeds the unbacked amount of the spend transaction")
       end
     end
+  end
+
+  # The concrete standalone ledger model (table: wallets_allocations via the
+  # default config). Embedders subclass AllocationBase instead.
+  class Allocation < AllocationBase
   end
 end

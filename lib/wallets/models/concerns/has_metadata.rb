@@ -14,13 +14,18 @@ module Wallets
       before_save :sync_metadata_cache
     end
 
+    # read_attribute/write_attribute, NOT `super`: this concern is included on
+    # the abstract *Base classes, while ActiveRecord generates the plain
+    # attribute readers/writers lazily on each CONCRETE descendant — below
+    # this module in the ancestor chain — so a `super` here can find no
+    # generated method to call.
     def metadata
-      @indifferent_metadata ||= ActiveSupport::HashWithIndifferentAccess.new(super || {})
+      @indifferent_metadata ||= ActiveSupport::HashWithIndifferentAccess.new(read_attribute(:metadata) || {})
     end
 
     def metadata=(hash)
       @indifferent_metadata = nil
-      super(hash.respond_to?(:to_h) ? hash.to_h : {})
+      write_attribute(:metadata, hash.respond_to?(:to_h) ? hash.to_h : {})
     end
 
     def reload(*)

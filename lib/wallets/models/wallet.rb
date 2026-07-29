@@ -11,7 +11,15 @@ module Wallets
   # This class supports embedding: subclasses can override config, callbacks,
   # table names, and related model classes without affecting the base Wallets::*
   # behavior in the same application.
-  class Wallet < ApplicationRecord
+  class WalletBase < ApplicationRecord
+    # Abstract on purpose: embedders (like usage_credits) subclass THIS
+    # class, not the concrete Wallet below. ActiveRecord builds a
+    # subclass's attribute methods on its parent's, so a concrete parent
+    # forces a schema load of the wallets_* tables — which do not exist in
+    # apps that only run an embedded ledger (fresh usage_credits installs).
+    # An abstract parent makes each embedded subclass its own base_class
+    # and keeps the base tables out of the picture entirely.
+    self.abstract_class = true
     include Wallets::Embeddable
     include Wallets::HasMetadata
 
@@ -65,7 +73,10 @@ module Wallets
     # default never reaches these associations.
     belongs_to :owner, polymorphic: true, optional: false
 
-    has_many :transactions, class_name: "Wallets::Transaction", dependent: :destroy
+    # foreign_key is explicit because this association is declared on the
+    # abstract WalletBase: ActiveRecord would otherwise derive it from the
+    # declaring class name ("wallet_base_id").
+    has_many :transactions, class_name: "Wallets::Transaction", foreign_key: :wallet_id, inverse_of: :wallet, dependent: :destroy
     has_many :outgoing_transfers,
       class_name: "Wallets::Transfer",
       foreign_key: :from_wallet_id,
@@ -708,5 +719,10 @@ module Wallets
     def normalize_asset_code!
       self.asset_code = Wallets.normalize_asset_code(asset_code).presence
     end
+  end
+
+  # The concrete standalone ledger model (table: wallets_wallets via the
+  # default config). Embedders subclass WalletBase instead.
+  class Wallet < WalletBase
   end
 end

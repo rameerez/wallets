@@ -131,7 +131,7 @@ class EmbeddabilityTest < ActiveSupport::TestCase
     end
   end
 
-  class EmbeddedWallet < Wallets::Wallet
+  class EmbeddedWallet < Wallets::WalletBase
     self.embedded_table_name = "embedded_wallets"
     self.config_provider = -> { EmbeddabilityTest.embedded_config }
     self.callbacks_module = EmbeddabilityTest::EmbeddedCallbacks
@@ -165,7 +165,7 @@ class EmbeddabilityTest < ActiveSupport::TestCase
       inverse_of: :to_wallet
   end
 
-  class EmbeddedTransaction < Wallets::Transaction
+  class EmbeddedTransaction < Wallets::TransactionBase
     self.embedded_table_name = "embedded_transactions"
     self.config_provider = -> { EmbeddabilityTest.embedded_config }
 
@@ -184,7 +184,7 @@ class EmbeddabilityTest < ActiveSupport::TestCase
       inverse_of: :source_transaction
   end
 
-  class EmbeddedAllocation < Wallets::Allocation
+  class EmbeddedAllocation < Wallets::AllocationBase
     self.embedded_table_name = "embedded_allocations"
     self.config_provider = -> { EmbeddabilityTest.embedded_config }
 
@@ -198,7 +198,7 @@ class EmbeddabilityTest < ActiveSupport::TestCase
       inverse_of: :incoming_allocations
   end
 
-  class EmbeddedTransfer < Wallets::Transfer
+  class EmbeddedTransfer < Wallets::TransferBase
     self.embedded_table_name = "embedded_transfers"
     self.config_provider = -> { EmbeddabilityTest.embedded_config }
     self.transaction_class_name = "EmbeddabilityTest::EmbeddedTransaction"
@@ -218,6 +218,26 @@ class EmbeddabilityTest < ActiveSupport::TestCase
     EmbeddabilityTest.reset_embedded_config!
     EmbeddedCallbacks.reset!
     cleanup_embedded_records!
+  end
+
+  test "embedded classes are their own base_class so the base tables are never consulted" do
+    # Regression guard for the fresh-install crash: ActiveRecord builds a
+    # subclass's attribute methods on its parent's (`superclass.
+    # define_attribute_methods unless base_class?`), so embedding under a
+    # CONCRETE parent forces a schema load of the wallets_* tables — which
+    # don't exist in apps that only run an embedded ledger. Subclassing the
+    # abstract *Base classes makes every embedded model its own base_class.
+    [EmbeddedWallet, EmbeddedTransaction, EmbeddedAllocation, EmbeddedTransfer].each do |model|
+      assert_equal model, model.base_class,
+        "#{model} must be its own base_class (abstract parent), or fresh embedded-only installs crash"
+      assert_predicate model.superclass, :abstract_class?,
+        "#{model}'s parent must be abstract so AR never loads the base wallets_* schema"
+    end
+
+    # The standalone concrete models keep working exactly as before.
+    [Wallets::Wallet, Wallets::Transaction, Wallets::Allocation, Wallets::Transfer].each do |model|
+      assert_equal model, model.base_class
+    end
   end
 
   test "embedded classes use custom config provider" do

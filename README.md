@@ -807,12 +807,15 @@ So the right framing is: strong internal wallet/accounting primitive, not money 
 
 ## Embedding `wallets` in your own gem
 
-`wallets` is built to be embeddable: other gems can reuse the ledger core (expiration-aware allocation, locking, transfers, callbacks) on top of their **own** tables, config, and event names. This is exactly how [`usage_credits`](https://github.com/rameerez/usage_credits) works — its `UsageCredits::Wallet` is a `Wallets::Wallet` subclass living in `usage_credits_*` tables.
+`wallets` is built to be embeddable: other gems can reuse the ledger core (expiration-aware allocation, locking, transfers, callbacks) on top of their **own** tables, config, and event names. This is exactly how [`usage_credits`](https://github.com/rameerez/usage_credits) works — its `UsageCredits::Wallet` is a `Wallets::WalletBase` subclass living in `usage_credits_*` tables.
+
+> [!IMPORTANT]
+> **Subclass the abstract `*Base` classes** (`Wallets::WalletBase`, `Wallets::TransactionBase`, `Wallets::AllocationBase`, `Wallets::TransferBase`) — **not** the concrete `Wallets::Wallet` etc. ActiveRecord builds a subclass's attribute methods on its parent's, so subclassing a concrete model forces a schema load of the `wallets_*` tables — which don't exist in apps that only install your gem. The abstract parents make each embedded model its own `base_class`, so the base tables are never consulted.
 
 These class-level hooks are a supported, stable contract (covered by tests — breaking them is a breaking change for downstream gems):
 
 ```ruby
-class MyGem::Wallet < Wallets::Wallet
+class MyGem::Wallet < Wallets::WalletBase
   self.embedded_table_name = "my_gem_wallets"            # your table, not wallets_wallets
   self.config_provider = -> { MyGem.configuration }      # your config object
   self.callbacks_module = MyGem::Callbacks               # your callback dispatcher
@@ -841,7 +844,7 @@ class MyGem::Wallet < Wallets::Wallet
 end
 ```
 
-Your `Transaction`, `Allocation`, and `Transfer` subclasses set `embedded_table_name` (and `config_provider` / `transaction_class_name` where relevant) the same way.
+Your `Transaction`, `Allocation`, and `Transfer` subclasses (of `Wallets::TransactionBase`, `Wallets::AllocationBase`, `Wallets::TransferBase`) set `embedded_table_name` (and `config_provider` / `transaction_class_name` where relevant) the same way.
 
 One current limitation to be aware of: the core models declare their associations against the `Wallets::*` class names, so your subclasses should **re-declare associations** with your own classes (`belongs_to :wallet, class_name: "MyGem::Wallet"`, etc.) so that records load as your subclasses rather than the core ones. See `usage_credits`' models for the canonical embedding pattern.
 

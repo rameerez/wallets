@@ -8,7 +8,15 @@ module Wallets
   # Transfers keep the outbound leg singular and the inbound legs plural so the
   # receiver can preserve the sender's expiration buckets when one transfer
   # consumes multiple source transactions with different expirations.
-  class Transfer < ApplicationRecord
+  class TransferBase < ApplicationRecord
+    # Abstract on purpose: embedders (like usage_credits) subclass THIS
+    # class, not the concrete Transfer below. ActiveRecord builds a
+    # subclass's attribute methods on its parent's, so a concrete parent
+    # forces a schema load of the wallets_* tables — which do not exist in
+    # apps that only run an embedded ledger (fresh usage_credits installs).
+    # An abstract parent makes each embedded subclass its own base_class
+    # and keeps the base tables out of the picture entirely.
+    self.abstract_class = true
     include Wallets::Embeddable
     include Wallets::HasMetadata
 
@@ -97,5 +105,10 @@ module Wallets
 
       transaction_class.where(transfer_id: id, wallet_id: wallet_id)
     end
+  end
+
+  # The concrete standalone ledger model (table: wallets_transfers via the
+  # default config). Embedders subclass TransferBase instead.
+  class Transfer < TransferBase
   end
 end
