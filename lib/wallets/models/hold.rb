@@ -78,7 +78,7 @@ module Wallets
     scope :released, -> { where(arel_table[:released_at].not_eq(nil)) }
     scope :coverage, -> { where(arel_table[:amount].eq(nil)) }
     scope :reservations, -> { where(arel_table[:amount].not_eq(nil)) }
-    scope :for_wallet_scope, -> { where(arel_table[:transaction_id].eq(nil)) }
+    scope :wallet_scoped, -> { where(arel_table[:transaction_id].eq(nil)) }
     scope :credit_scoped, -> { where(arel_table[:transaction_id].not_eq(nil)) }
 
     def active?(at: Time.current)
@@ -113,6 +113,20 @@ module Wallets
 
     def credit_scoped?
       !wallet_scoped?
+    end
+
+    # Ends this hold now: its value is available again, unless another reason
+    # still holds it. Idempotent: a hold that has already ended (released,
+    # captured, or past its deadline) is returned unchanged and reports
+    # nothing. Why it ended is recorded next to why it began, never over it.
+    #
+    #   hold.release!(reason: "cleared_by_operator", metadata: {actor_id: operator.id})
+    def release!(reason: nil, metadata: {})
+      raise InvalidHold, "Only a saved hold can be released" unless persisted?
+
+      # The wallet runs the release: it takes its own lock before reading
+      # this hold, the same order as every other command.
+      wallet.send(:release_hold!, self, reason: reason, metadata: metadata)
     end
 
     private

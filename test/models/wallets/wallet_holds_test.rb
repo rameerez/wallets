@@ -4,8 +4,8 @@ require "test_helper"
 
 # Holds and reservations as the wallet's balance math sees them: available,
 # held and total balance, FEFO eligibility, signed availability, and how a
-# wallet's holds go when the wallet does. Hold rows are written directly; the
-# commands that create them under the wallet lock come later.
+# wallet's holds go when the wallet does. Hold rows are written directly, so
+# the math is pinned beneath the commands (WalletHoldCommandsTest).
 class Wallets::WalletHoldsTest < ActiveSupport::TestCase
   # A ledger that opted in with a hold class whose table does not exist.
   class MissingTableHold < Wallets::HoldBase
@@ -395,6 +395,44 @@ class Wallets::WalletHoldsTest < ActiveSupport::TestCase
     end
   end
 
+  test "each balance reader is one statement, so all its terms share one snapshot" do
+    # Separate statements would each see their own snapshot under read
+    # committed: a covered credit committed between two of them could count
+    # in P and miss C.
+    wallet = points_wallet
+    held = wallet.credit(100, category: :reward)
+    wallet.credit(50, category: :top_up)
+    wallet.debit(10, category: :purchase)
+    hold!(wallet, held)
+    reservation!(wallet, 20)
+
+    {balance: 30, available_balance: 30, held_balance: 110, total_balance: 140}.each do |reader, expected|
+      value = nil
+      statements = capture_sql { value = wallet.public_send(reader) }
+
+      assert_equal expected, value, reader
+      assert_equal 1, statements.size, "#{reader} must be one statement:\n#{statements.join("\n")}"
+      assert_match(/wallets_holds/, statements.sole, "#{reader} reads the reservations in the same statement")
+    end
+  end
+
+  test "available, held and total come from one set of components" do
+    Wallets.configuration.allow_negative_balance = true
+    wallet = points_wallet
+    held = wallet.credit(100, category: :reward)
+    wallet.credit(50, category: :top_up, expires_at: 1.day.from_now)
+    wallet.debit(200, category: :purchase)
+    wallet.credit(30, category: :reward)
+    hold!(wallet, held)
+    reservation!(wallet, 20)
+
+    components = wallet.send(:balance_components)
+
+    assert_equal [30, 0, 20, 50], components.to_a, "P, C, R, N: the held credit was spent before its hold"
+    assert_equal components.total, components.available + components.held
+    assert_equal [components.available, components.held, components.total], [wallet.balance, wallet.held_balance, wallet.total_balance]
+  end
+
   test "held balance can exceed total balance when coverage meets reservations" do
     wallet = points_wallet(100)
     reservation!(wallet, 80)
@@ -731,9 +769,43 @@ class Wallets::WalletHoldsTest < ActiveSupport::TestCase
     assert_operator wallet.updated_at, :>, before
   end
 
-  test "a stale snapshot is detected against the locked row and remembered until its transaction ends" do
-    # The interleavings themselves run on MySQL in CurrentReadsTest; this
-    # pins the bookkeeping on every adapter.
+  test "a command that moves no balance writes the wallet row even under no_touching" do
+    wallet = points_wallet(100)
+    hold!(wallet)
+    before = wallet.reload.updated_at
+
+    travel 1.second do
+      Wallets::Wallet.no_touching { wallet.credit(10, category: :reward) }
+    end
+
+    assert_operator wallet.reload.updated_at, :>, before
+    assert_equal 0, wallet.read_attribute(:balance)
+  end
+
+  test "two commands in one microsecond still leave two different rows behind" do
+    # A frozen clock stands in for two commits within one microsecond: the
+    # second marker steps past the first instead of repeating it.
+    freeze_time
+    wallet = points_wallet(100)
+    markers = [wallet.reload.updated_at]
+
+    wallet.debit(10, category: :purchase)               # the balance moves: save!
+    markers << wallet.reload.updated_at
+    hold!(wallet)
+    wallet.credit(5, category: :reward)                 # it does not: the marker alone
+    markers << wallet.reload.updated_at
+    wallet.credit(5, category: :reward)
+    markers << wallet.reload.updated_at
+
+    assert_equal markers.sort, markers
+    assert_equal markers.uniq, markers, "every command leaves a later marker"
+    assert_equal Rational(1, 1_000_000), markers.last - markers[-2]
+  end
+
+  test "a stale snapshot is detected against the locked row and remembered past its savepoint" do
+    # The interleavings themselves run on MySQL in CurrentReadsTest, and the
+    # end of the verdict in StaleSnapshotTest; this pins the detection on
+    # every adapter.
     wallet = points_wallet(100)
     Wallets::Wallet.stubs(:current_reads_need_locks?).returns(true)
 
@@ -750,7 +822,7 @@ class Wallets::WalletHoldsTest < ActiveSupport::TestCase
       raise ActiveRecord::Rollback
     end
 
-    refute wallet.reload.send(:stale_snapshot?), "forgotten when that transaction ends"
+    assert wallet.reload.send(:stale_snapshot?), "a savepoint ending is not the real transaction ending"
   end
 
   test "stale snapshots are never suspected where plain reads are always current" do

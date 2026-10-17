@@ -20,6 +20,7 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
   end
 
   test "creates the holds migration" do
+    Wallets.configuration.table_prefix = "upggen_" # an install without the holds table
     run_generator
 
     assert_migration "db/migrate/add_wallets_holds.rb" do |migration|
@@ -30,6 +31,7 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
   end
 
   test "running the generator again never adds a duplicate migration" do
+    Wallets.configuration.table_prefix = "upggen_"
     run_generator
     first_migration = migration_files.sole
 
@@ -67,6 +69,75 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
       (tables - ["upgcheck_holds"]).each do |table|
         assert connection.data_source_exists?(table), "rolling back the upgrade must leave #{table} alone"
       end
+    end
+  end
+
+  test "the generator writes no migration when the holds table already exists" do
+    # A fresh 0.4 install: this test database already has wallets_holds.
+    assert ActiveRecord::Base.connection.table_exists?("wallets_holds")
+
+    output = run_generator
+
+    assert_empty migration_files
+    assert_match(/skip.*wallets_holds already exists/, output)
+    assert_match(/nothing to migrate/, output)
+  end
+
+  test "the generator still writes the migration when it cannot ask the database" do
+    Wallets.configuration.table_prefix = "upggen_"
+    ActiveRecord::Base.stubs(:with_connection).raises(ActiveRecord::ConnectionNotEstablished, "no database yet")
+
+    run_generator
+
+    assert_equal 1, migration_files.size
+  end
+
+  test "rolling the upgrade back never deletes holds it did not create" do
+    # A fresh 0.4 install that ran the upgrade migration anyway: its `up` was
+    # a no-op, and its `down` must not take the install's holds with it.
+    Wallets.configuration.table_prefix = "upgkeep_"
+    tables = %w[upgkeep_wallets upgkeep_transfers upgkeep_transactions upgkeep_allocations upgkeep_holds]
+    run_generator
+
+    with_tables_cleaned_up(tables) do
+      migrate(install_migration, :up)
+      wallets, transactions, holds = models_for("upgkeep_")
+      wallet = create_row(wallets, asset_code: "coins", owner_type: "User", owner_id: 1)
+      credit = create_row(transactions, wallet_id: wallet.id, amount: 100, category: "credit")
+      holds.create!(wallet_id: wallet.id, transaction_id: credit.id, category: "review", metadata: {}, release_metadata: {})
+
+      migrate(upgrade_migration, :up)
+      error = assert_raises(ActiveRecord::IrreversibleMigration) { migrate(upgrade_migration, :down) }
+
+      assert_match(/upgkeep_holds still has holds/, error.message)
+      assert_equal 1, holds.count, "the hold survives the rollback"
+
+      holds.delete_all
+      migrate(upgrade_migration, :down)
+      refute connection.data_source_exists?("upgkeep_holds"), "an empty table is dropped"
+    ensure
+      [holds, transactions, wallets].each { |model| model&.delete_all if model&.table_exists? }
+    end
+  end
+
+  test "the upgrade takes a 0.2 install to exactly the holds table a fresh 0.4 install has" do
+    Wallets.configuration.table_prefix = "upg02_"
+    tables = %w[upg02_wallets upg02_transfers upg02_transactions upg02_allocations upg02_holds]
+    run_generator
+
+    with_tables_cleaned_up(tables) do
+      migrate(install_migration, :up)
+      fresh_install = table_shape("upg02_holds")
+      migrate(install_migration, :down)
+
+      migrate(install_migration(file_fixture("create_wallets_tables_0_2.rb.erb")), :up)
+      assert_empty connection.check_constraints("upg02_transactions"), "a 0.2 schema, before 0.3's check constraints"
+      refute connection.data_source_exists?("upg02_holds")
+
+      migrate(upgrade_migration, :up)
+
+      assert_equal fresh_install, table_shape("upg02_holds")
+      assert_holds_table_enforces_its_keys("upg02_")
     end
   end
 
@@ -190,8 +261,7 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
     sandbox.const_get(:AddWalletsHolds).new
   end
 
-  def install_migration
-    template = File.expand_path("../../lib/generators/wallets/templates/create_wallets_tables.rb.erb", __dir__)
+  def install_migration(template = File.expand_path("../../lib/generators/wallets/templates/create_wallets_tables.rb.erb", __dir__))
     path = File.join(destination_root, "create_wallets_tables.rb")
     File.write(path, ERB.new(File.read(template), trim_mode: "-").result_with_hash(migration_version: "[#{ActiveRecord::VERSION::STRING.to_f}]"))
 
@@ -223,10 +293,7 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
   # Inserting through real keys proves every foreign key column can hold the
   # key it references, and that the check constraints are live.
   def assert_holds_table_enforces_its_keys(prefix)
-    wallets = Class.new(ActiveRecord::Base) { self.table_name = "#{prefix}wallets" }
-    transactions = Class.new(ActiveRecord::Base) { self.table_name = "#{prefix}transactions" }
-    holds = Class.new(ActiveRecord::Base) { self.table_name = "#{prefix}holds" }
-    [wallets, transactions, holds].each(&:reset_column_information)
+    wallets, transactions, holds = models_for(prefix)
 
     wallet = create_row(wallets, asset_code: "coins", owner_type: "User", owner_id: 1)
     credit = create_row(transactions, wallet_id: wallet.id, amount: 100, category: "credit")
@@ -242,6 +309,13 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
     assert_equal 2, holds.count
   ensure
     [holds, transactions, wallets].each { |model| model&.delete_all }
+  end
+
+  # Bare models over a prefixed ledger's wallets, transactions and holds.
+  def models_for(prefix)
+    %w[wallets transactions holds].map do |suffix|
+      Class.new(ActiveRecord::Base) { self.table_name = "#{prefix}#{suffix}" }.tap(&:reset_column_information)
+    end
   end
 
   # Fills the columns a full install requires; the bare tables built by

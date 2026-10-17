@@ -530,7 +530,7 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     # Safety net for the rare race where a bucket expires between the
     # balance pre-check and the FIFO allocation query.
     wallet = create_wallet(users(:new_user), asset_code: :race_guard, initial_balance: 100)
-    wallet.stubs(:allocate_debit!).returns(25)
+    wallet.stubs(:allocate_debit!).returns([stub(amount: 25)])
 
     error = assert_raises(Wallets::InsufficientBalance) { wallet.debit(50, category: :purchase) }
     assert_includes error.message, "balance buckets"
@@ -542,10 +542,9 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     wallet = wallets_wallets(:rich_coins_wallet)
     transfer = stub(id: 42)
     allocation = stub(amount: 30, source_transaction: stub(expires_at: nil))
-    outbound = stub(outgoing_allocations: stub(includes: stub(order: stub(to_a: [allocation]))))
 
     error = assert_raises(Wallets::InvalidTransfer) do
-      wallet.send(:build_preserved_transfer_inbound_credit_specs, transfer, outbound, 100)
+      wallet.send(:build_preserved_transfer_inbound_credit_specs, transfer, [allocation], 100)
     end
 
     assert_includes error.message, "could not preserve expiration buckets"
@@ -557,7 +556,7 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     assert_raises(ArgumentError) do
       wallet.send(
         :build_transfer_inbound_credit_specs,
-        transfer: nil, outbound_transaction: nil, amount: 10,
+        transfer: nil, allocations: [], amount: 10,
         expiration_policy: "bogus", expires_at: nil
       )
     end

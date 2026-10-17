@@ -54,8 +54,9 @@ class ActiveSupport::TestCase
   end
 
   # Hold rows written straight to the table: a credit hold when given a
-  # credit, else a wallet hold. Commands that create holds under the wallet
-  # lock come later; these pin the model and the balance math under them.
+  # credit, else a wallet hold. They pin the model and the balance math
+  # beneath the commands, and build rows the commands cannot (a capture link).
+  # Code under test creates holds with `hold`, `reserve` and `credit(hold:)`.
   def hold!(wallet, credit = nil, category: :review, **attributes)
     Wallets::Hold.create!(wallet: wallet, credit: credit, category: category, **attributes)
   end

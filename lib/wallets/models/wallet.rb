@@ -44,6 +44,20 @@ module Wallets
     SNAPSHOT_READ_ADAPTERS = /mysql|trilogy/i
     private_constant :SNAPSHOT_READ_ADAPTERS
 
+    # The smallest step the wallet row's `updated_at` column can record.
+    MARKER_STEP = Rational(1, 1_000_000)
+    private_constant :MARKER_STEP
+
+    # What `hold` holds when no credit is passed at all. A sentinel rather
+    # than nil, so a nil from a lookup that found nothing is an error instead
+    # of a freeze on the whole wallet.
+    WHOLE_WALLET = Object.new.freeze
+    private_constant :WHOLE_WALLET
+
+    # The keywords `credit(..., hold: {...})` accepts: the ones `hold` takes.
+    ARRIVAL_HOLD_OPTIONS = %i[category until metadata].freeze
+    private_constant :ARRIVAL_HOLD_OPTIONS
+
     self.table_suffix = "wallets"
 
     # =========================================
@@ -72,7 +86,9 @@ module Wallets
       insufficient: :insufficient_balance,
       low_balance: :low_balance_reached,
       depleted: :balance_depleted,
-      transfer_completed: :transfer_completed
+      transfer_completed: :transfer_completed,
+      hold_created: :hold_created,
+      hold_released: :hold_released
     }.freeze
 
     def self.transaction_class
@@ -108,6 +124,9 @@ module Wallets
     # statement (and refuses FOR UPDATE beside an aggregate), and SQLite
     # serializes writers, so both already read current rows. Whether a given
     # mutation actually needs locking reads is `stale_snapshot?`.
+    #
+    # @api private Public only because wallet instances ask it through their
+    # class; not part of the supported API, and free to change in any release.
     def self.current_reads_need_locks?
       transaction_class.connection.adapter_name.match?(SNAPSHOT_READ_ADAPTERS)
     end
@@ -118,6 +137,10 @@ module Wallets
     # covers at `at`: a hold on that very credit, or a hold on its whole
     # wallet. Correlated EXISTS, never a join, so a credit held for two
     # reasons still counts once.
+    #
+    # @api private Public only so `Transaction#held?` and friends share this
+    # one definition; not part of the supported API, and free to change in
+    # any release.
     def self.coverage_sql(at:, lock: false)
       holds = hold_class.arel_table
       credits = transaction_class.arel_table
@@ -125,7 +148,7 @@ module Wallets
       active_holds = active_holds.lock("FOR UPDATE") if lock && current_reads_need_locks?
 
       credit_holds = active_holds.where(holds[:transaction_id].eq(credits[:id]))
-      wallet_holds = active_holds.coverage.for_wallet_scope.where(holds[:wallet_id].eq(credits[:wallet_id]))
+      wallet_holds = active_holds.coverage.wallet_scoped.where(holds[:wallet_id].eq(credits[:wallet_id]))
 
       "(EXISTS (#{credit_holds.to_sql}) OR EXISTS (#{wallet_holds.to_sql}))"
     end
@@ -163,6 +186,18 @@ module Wallets
     validates :balance, numericality: {only_integer: true}
 
     before_validation :normalize_asset_code!
+
+    # A caller's own write to the wallet row inside a transaction leaves that
+    # transaction reading its own version of the row, which then matches the
+    # locked row even while its ledger snapshot is stale (see
+    # `stale_snapshot?`). Such a wallet counts as stale for the rest of the
+    # transaction: conservative, and it only ever costs locking reads.
+    # Creating the wallet is exempt (nobody else can have touched a ledger
+    # nobody else can see), and so is the ledger's own refresh. Writes that
+    # skip Active Record callbacks (raw SQL, `update_columns`) are outside the
+    # supported API.
+    after_save :remember_own_write, if: :saved_changes?, unless: :previously_new_record?
+    after_touch :remember_own_write
 
     # =========================================
     # Class Methods
@@ -243,13 +278,13 @@ module Wallets
       current_balance
     end
 
+    # A ledger without holds computes exactly what 0.3 did, through the two
+    # helpers an embedder may override (D12). With holds, every term comes
+    # from one statement (see `balance_components`).
     def current_balance
-      at = evaluation_time
+      return positive_remaining_balance - unbacked_negative_balance unless holds_enabled?
 
-      positive_remaining_balance(at: at) -
-        covered_remaining_balance(at: at) -
-        reserved_balance(at: at) -
-        unbacked_negative_balance
+      balance_components.available
     end
 
     def available_balance
@@ -263,16 +298,16 @@ module Wallets
     def held_balance
       return 0 unless holds_enabled?
 
-      at = evaluation_time
-      covered_remaining_balance(at: at) + reserved_balance(at: at)
+      balance_components.held
     end
 
-    # Everything the ledger holds for the owner, spendable or not. Defined as
-    # available plus held at one instant, so the identity holds by
-    # construction, even for an embedder whose `current_balance` applies its
-    # own policy (and, without holds, it is simply `balance`).
+    # Everything the ledger holds for the owner, spendable or not: P - N.
+    # Without holds it is simply `balance`, whatever policy an embedder's
+    # `current_balance` applies.
     def total_balance
-      evaluating_at(evaluation_time) { balance + held_balance }
+      return balance unless holds_enabled?
+
+      balance_components.total
     end
 
     # Whether a hold covers the whole wallet, including credits received
@@ -280,7 +315,7 @@ module Wallets
     def on_hold?
       return false unless holds_enabled?
 
-      wallet_holds.coverage.for_wallet_scope.active(at: evaluation_time).exists?
+      wallet_holds.coverage.wallet_scoped.active(at: evaluation_time).exists?
     end
 
     def holds_enabled?
@@ -302,19 +337,38 @@ module Wallets
     # Credit & Debit Operations
     # =========================================
 
-    def credit(amount, metadata: {}, category: :credit, expires_at: nil, transfer: nil, **extra_transaction_attributes)
+    # Adds value to the wallet. With `hold:` or `available_at:` the value
+    # arrives held: the credit and its hold are written in one step, so it is
+    # never spendable in between, and the callbacks report the finished
+    # operation.
+    #
+    #   wallet.credit(751, category: :reward, hold: :pending_validation)
+    #   wallet.credit(751, category: :reward, hold: {category: :pending_validation, until: 3.months.from_now, metadata: {ride_id: 7}})
+    #   wallet.credit(500, category: :reward, available_at: 14.days.from_now) # held as :pending until then
+    def credit(amount, metadata: {}, category: :credit, expires_at: nil, transfer: nil, hold: nil, available_at: nil, **extra_transaction_attributes)
       metadata = normalize_metadata(metadata)
       extra_transaction_attributes = validate_additional_transaction_attributes!(extra_transaction_attributes)
+      arrival_hold = arrival_hold_attributes(hold, available_at)
 
-      with_lock do
-        apply_credit(
-          amount,
-          metadata: metadata,
-          category: category,
-          expires_at: expires_at,
-          transfer: transfer,
-          extra_attributes: extra_transaction_attributes
-        )
+      # A savepoint even inside a caller's transaction, like every command: a
+      # credit that cannot get its hold must not survive as a spendable credit
+      # because the caller rescued the error and committed.
+      with_lock(requires_new: true) do
+        mutating_at(Time.current) do
+          # Value that becomes available at an instant already reached is
+          # simply available: there is nothing left to hold.
+          arrival_hold = nil if available_at && arrival_hold[:releases_at] <= evaluation_time
+
+          apply_credit(
+            amount,
+            metadata: metadata,
+            category: category,
+            expires_at: expires_at,
+            transfer: transfer,
+            extra_attributes: extra_transaction_attributes,
+            hold: arrival_hold
+          )
+        end
       end
     end
 
@@ -322,7 +376,7 @@ module Wallets
       metadata = normalize_metadata(metadata)
       extra_transaction_attributes = validate_additional_transaction_attributes!(extra_transaction_attributes)
 
-      with_lock do
+      with_lock(requires_new: true) do
         apply_debit(
           amount,
           metadata: metadata,
@@ -334,6 +388,66 @@ module Wallets
     end
 
     # =========================================
+    # Holds & Reservations
+    # =========================================
+
+    # Keeps value in the wallet but out of `balance` until the hold is
+    # released or its deadline passes. Given a credit, it holds that credit's
+    # whole remaining value; without one, it holds every credit in the wallet,
+    # including credits that arrive later. Holding an already held credit is
+    # fine: each hold is an independent reason, released on its own.
+    #
+    #   wallet.hold(credit, category: :fraud_review, metadata: {case_id: 42})
+    #   wallet.hold(category: :chargeback, until: 30.days.from_now)
+    #
+    # Only leaving the credit out holds the whole wallet: an explicit nil
+    # (a credit that was looked up and not found) is refused.
+    def hold(credit = WHOLE_WALLET, category:, until: nil, metadata: {})
+      ensure_holds_enabled!
+      raise ArgumentError, "Pass no credit to hold the whole wallet; nil is not a credit" if credit.nil?
+
+      credit = nil if credit.equal?(WHOLE_WALLET)
+      metadata = normalize_metadata(metadata)
+      # `until` is a Ruby keyword: the argument reads as plain English at the
+      # call site, and the binding is the only way to reach it in here.
+      releases_at = normalize_deadline(binding.local_variable_get(:until))
+
+      with_lock(requires_new: true) do
+        mutating_at(Time.current) do
+          ensure_deadline_ahead!(releases_at)
+          ensure_holdable!(credit) unless credit.nil?
+
+          place_hold!(credit: credit, category: category, releases_at: releases_at, metadata: metadata)
+        end
+      end
+    end
+
+    # Sets an amount of the available balance aside, like a pending card
+    # charge; reservations add up. Funded exactly like a debit: the amount
+    # must fit in `balance` unless `allow_negative_balance` is on.
+    #
+    #   wallet.reserve(3_000, category: :booking, until: 7.days.from_now, metadata: {booking_id: 9})
+    def reserve(amount, category:, until: nil, metadata: {})
+      ensure_holds_enabled!
+      amount = normalize_positive_amount!(amount)
+      metadata = normalize_metadata(metadata)
+      releases_at = normalize_deadline(binding.local_variable_get(:until))
+
+      with_lock(requires_new: true) do
+        mutating_at(Time.current) do
+          ensure_deadline_ahead!(releases_at)
+          available = balance
+
+          if amount > available && !allow_negative_balance?
+            reject_insufficient_balance!(amount, available, metadata)
+          end
+
+          place_hold!(amount: amount, category: category, releases_at: releases_at, metadata: metadata, previous_balance: available)
+        end
+      end
+    end
+
+    # =========================================
     # Transfers
     # =========================================
 
@@ -341,15 +455,20 @@ module Wallets
       raise InvalidTransfer, "Target wallet is required" if other_wallet.nil?
       raise InvalidTransfer, "Source wallet must be persisted" unless persisted?
       raise InvalidTransfer, "Target wallet must be persisted" unless other_wallet.persisted?
+      # The class first: two ledgers keep separate tables, so a wallet of
+      # another class can share this wallet's id without being this wallet.
+      raise InvalidTransfer, "Wallet classes must match" unless other_wallet.instance_of?(self.class)
       raise InvalidTransfer, "Cannot transfer to the same wallet" if other_wallet.id == id
       raise InvalidTransfer, "Wallet assets must match" unless asset_code == other_wallet.asset_code
-      raise InvalidTransfer, "Wallet classes must match" unless other_wallet.instance_of?(self.class)
 
       amount = normalize_positive_amount!(amount)
       metadata = normalize_metadata(metadata)
       resolved_policy, inbound_expires_at = resolve_transfer_expiration!(expiration_policy, expires_at)
 
-      self.class.transaction do
+      # A savepoint even inside a caller's transaction, like every command: a
+      # transfer whose inbound leg fails must take its outbound debit and its
+      # Transfer row with it, even when the caller rescues and commits.
+      self.class.transaction(requires_new: true) do
         lock_wallet_pair!(other_wallet)
         now = Time.current
 
@@ -424,7 +543,7 @@ module Wallets
             "transfer_expiration_policy" => resolved_policy
           )
 
-          outbound_transaction = apply_debit(
+          _outbound_transaction, allocations = apply_debit_with_allocations(
             amount,
             category: :transfer_out,
             metadata: shared_metadata.merge(
@@ -437,7 +556,7 @@ module Wallets
 
           build_transfer_inbound_credit_specs(
             transfer: transfer,
-            outbound_transaction: outbound_transaction,
+            allocations: allocations,
             amount: amount,
             expiration_policy: resolved_policy,
             expires_at: inbound_expires_at
@@ -510,10 +629,15 @@ module Wallets
       callback_dispatcher = callbacks
       dispatch = -> { callback_dispatcher.dispatch(event, **data) }
 
-      # Successful ledger callbacks describe committed facts. Deferring them
-      # through the outermost transaction prevents notifications/jobs for rows
-      # that a caller later rolls back. Failure callbacks are intentionally
-      # immediate because their transaction is about to roll back by design.
+      # Successful ledger callbacks describe committed facts, so they wait for
+      # the commit. They are queued on the innermost open transaction, the
+      # command's own savepoint: a failure later in the command rolls it back
+      # and drops them, even when the caller rescues and commits; a released
+      # savepoint hands them to its parent; an enclosing rollback drops them.
+      # The same rules as Active Record's own after_commit, which also treats a
+      # `transaction(joinable: false)` as a commit boundary. Failure callbacks
+      # are intentionally immediate because their transaction is about to roll
+      # back by design.
       if kind == :insufficient || !ActiveRecord.respond_to?(:after_all_transactions_commit)
         dispatch.call
       else
@@ -581,24 +705,52 @@ module Wallets
     # stress run). Kept to the stale case, which needs a caller that read
     # first AND a concurrent change to this same wallet, they are rare.
     #
-    # A stale verdict is remembered until the transaction ends: once this
-    # transaction writes the wallet row, its snapshot shows its own write and
-    # could no longer tell.
+    # A stale verdict is remembered for as long as the real database
+    # transaction lasts, savepoints and all: once this transaction writes the
+    # wallet row, its snapshot shows its own write and could no longer tell.
     def stale_snapshot?
       return false unless self.class.current_reads_need_locks?
-
-      stale_snapshots = ActiveSupport::IsolatedExecutionState[:wallets_stale_snapshots] ||= Set.new
-      key = [self.class.connection.object_id, self.class.table_name, id]
-      return true if stale_snapshots.include?(key)
+      return true if remembered_stale_snapshots.include?(stale_snapshot_key)
 
       snapshot = self.class.uncached { self.class.unscoped.where(id: id).pick(:updated_at, :balance) }
       return false if snapshot == [updated_at, read_attribute(:balance)]
 
-      stale_snapshots << key
-      transaction = self.class.current_transaction
-      transaction.after_commit { stale_snapshots.delete(key) }
-      transaction.after_rollback { stale_snapshots.delete(key) }
+      remember_stale_snapshot!
       true
+    end
+
+    def remember_stale_snapshot!
+      remembered = remembered_stale_snapshots
+      key = stale_snapshot_key
+      return if remembered.include?(key)
+
+      remembered << key
+      at_end_of_real_transaction(self.class.connection) { remembered.delete(key) }
+    end
+
+    # Per thread, and per connection inside it: a verdict is about one
+    # connection's database transaction, never another's.
+    def remembered_stale_snapshots
+      ActiveSupport::IsolatedExecutionState[:wallets_stale_snapshots] ||= Set.new
+    end
+
+    def stale_snapshot_key
+      [self.class.connection.object_id, self.class.table_name, id]
+    end
+
+    # Runs the block once the real database transaction open on `connection`
+    # ends, by commit or by rollback, however deep in savepoints this is
+    # called. A savepoint's own hooks are not enough: one released under a
+    # `transaction(joinable: false)` runs its commit hooks at once, with the
+    # real transaction (and its snapshot) still open. So each hook hands the
+    # block on to the next transaction out, until none is left.
+    def at_end_of_real_transaction(connection, &block)
+      transaction = connection.current_transaction
+      return yield unless transaction.open?
+
+      hand_on = -> { at_end_of_real_transaction(connection, &block) }
+      transaction.after_commit(&hand_on)
+      transaction.after_rollback(&hand_on)
     end
 
     # Turns a read a mutation decides on into a current read (see
@@ -622,10 +774,16 @@ module Wallets
     # Credit/Debit Implementation
     # =========================================
 
-    def apply_credit(amount, metadata:, category:, expires_at:, transfer:, extra_attributes: {}, at: evaluation_time)
+    # `hold:` (category, releases_at, metadata) places a hold on the new
+    # credit before anything reads the balance again, so no snapshot, cache
+    # or callback ever sees the value spendable. A credit never lowers the
+    # available balance (a hold on arrival covers only the credit itself), so
+    # it can cross no threshold.
+    def apply_credit(amount, metadata:, category:, expires_at:, transfer:, extra_attributes: {}, hold: nil, at: evaluation_time)
       mutating_at(at) do
         amount = normalize_positive_amount!(amount)
         validate_expiration!(expires_at, at: evaluation_time)
+        ensure_deadline_ahead!(hold[:releases_at]) if hold
 
         previous_balance = balance
 
@@ -638,6 +796,7 @@ module Wallets
             transfer: transfer
           }.merge(extra_attributes)
         )
+        arrival_hold = hold_class.create!(wallet: self, credit: transaction, **hold) if hold
 
         new_balance = refresh_cached_balance!
         transaction.sync_balance_snapshot!(before: previous_balance, after: new_balance)
@@ -650,12 +809,19 @@ module Wallets
           previous_balance: previous_balance,
           new_balance: new_balance,
           metadata: metadata)
+        dispatch_hold_created!(arrival_hold, previous_balance: previous_balance, new_balance: new_balance) if arrival_hold
 
         transaction
       end
     end
 
-    def apply_debit(amount, metadata:, category:, transfer:, extra_attributes: {}, allow_unbacked: allow_negative_balance?, at: evaluation_time)
+    def apply_debit(...)
+      apply_debit_with_allocations(...).first
+    end
+
+    # The debit, and the allocations that fund it, each holding the very
+    # source row the allocator locked (a transfer keeps their expirations).
+    def apply_debit_with_allocations(amount, metadata:, category:, transfer:, extra_attributes: {}, allow_unbacked: allow_negative_balance?, at: evaluation_time)
       mutating_at(at) do
         amount = normalize_positive_amount!(amount)
         previous_balance = balance
@@ -673,7 +839,8 @@ module Wallets
           }.merge(extra_attributes)
         )
 
-        remaining_to_allocate = allocate_debit!(spend_transaction, amount)
+        allocations = allocate_debit!(spend_transaction, amount)
+        remaining_to_allocate = amount - allocations.sum(&:amount)
 
         if remaining_to_allocate.positive? && !allow_unbacked
           raise InsufficientBalance, "Not enough balance buckets to cover the debit"
@@ -693,12 +860,15 @@ module Wallets
 
         dispatch_balance_threshold_callbacks!(previous_balance, new_balance)
 
-        spend_transaction
+        [spend_transaction, allocations]
       end
     end
 
+    # Allocates `amount` of the debit to eligible buckets and returns the
+    # allocations, in order. Whatever no bucket can back is left unbacked.
     def allocate_debit!(spend_transaction, amount)
       remaining_to_allocate = amount
+      allocations = []
 
       # Only eligible buckets fund a debit (see `eligible_credits`).
       # Reservations pin no bucket: affordability enforces them, so ordinary
@@ -723,7 +893,7 @@ module Wallets
 
         allocation_amount = [leftover, remaining_to_allocate].min
 
-        allocation_class.create!(
+        allocations << allocation_class.create!(
           spend_transaction: spend_transaction,
           source_transaction: source_transaction,
           amount: allocation_amount
@@ -733,7 +903,148 @@ module Wallets
         break if remaining_to_allocate <= 0
       end
 
-      remaining_to_allocate
+      allocations
+    end
+
+    # =========================================
+    # Hold Implementation
+    # =========================================
+
+    # Writes a hold and reports it: one cache refresh, `hold_created`, then
+    # the threshold crossings from the balances before and after. A hold can
+    # lower the available balance (a credit hold, a wallet hold, a
+    # reservation) or leave it where it was (another reason on value already
+    # held), and only a real crossing is reported.
+    def place_hold!(previous_balance: balance, **attributes)
+      hold = hold_class.create!(wallet: self, **attributes)
+      new_balance = refresh_cached_balance!
+
+      dispatch_hold_created!(hold, previous_balance: previous_balance, new_balance: new_balance)
+      dispatch_balance_threshold_callbacks!(previous_balance, new_balance)
+
+      hold
+    end
+
+    # The wallet side of `Hold#release!`. The wallet is locked first, like in
+    # every command, and only then is the hold read, so concurrent releases
+    # (or a release racing a capture) queue on the wallet and every one after
+    # the first finds the hold already ended. Releasing gives value back and
+    # can never cross a low-balance threshold, so none is evaluated.
+    def release_hold!(hold, reason:, metadata:)
+      metadata = normalize_metadata(metadata)
+
+      with_lock(requires_new: true) do
+        mutating_at(Time.current) do
+          # A locking read: the hold as it is now, whatever an earlier read in
+          # this transaction saw.
+          hold.lock!
+
+          if hold.active?(at: evaluation_time)
+            previous_balance = balance
+            hold.update!(released_at: evaluation_time, release_reason: reason, release_metadata: metadata)
+            new_balance = refresh_cached_balance!
+
+            dispatch_callback(:hold_released,
+              wallet: self,
+              hold: hold,
+              previous_balance: previous_balance,
+              new_balance: new_balance,
+              metadata: hold.release_metadata)
+          end
+
+          hold
+        end
+      end
+    end
+
+    # A credit can be held when it is a saved credit of this very wallet and
+    # ledger, still unexpired at the command's instant, with value left to
+    # hold. Read from the database under the wallet lock, never from the
+    # caller's copy, so a debit that just spent it is seen.
+    def ensure_holdable!(credit)
+      unless credit.instance_of?(transaction_class)
+        raise InvalidHold, "A hold covers a #{transaction_class.name}, not #{credit.class.name}"
+      end
+      raise InvalidHold, "Only a saved credit can be held" unless credit.persisted?
+
+      row = current_read(transaction_class.where(id: credit.id), current_reads?)
+        .pick(:wallet_id, :amount, :expires_at, Arel.sql(remaining_amount_sql))
+      raise InvalidHold, "Transaction #{credit.id} no longer exists" if row.nil?
+
+      wallet_id, amount, expires_at, remaining = row
+      raise InvalidHold, "Transaction #{credit.id} belongs to another wallet" unless wallet_id == id
+      raise InvalidHold, "Transaction #{credit.id} is a debit: only credits can be held" unless amount.positive?
+      raise InvalidHold, "Credit #{credit.id} has expired" if expires_at.present? && expires_at <= evaluation_time
+      raise InvalidHold, "Credit #{credit.id} has no remaining value to hold" unless remaining.to_i.positive?
+    end
+
+    # The hold a credit arrives under, from `hold:` or `available_at:`,
+    # checked before anything is written. `hold:` is a category, or a Hash
+    # with the same keywords `hold` takes.
+    def arrival_hold_attributes(hold, available_at)
+      return if hold.nil? && available_at.nil?
+      raise ArgumentError, "Pass hold: or available_at:, not both" unless hold.nil? || available_at.nil?
+
+      ensure_holds_enabled!
+      return {category: :pending, releases_at: normalize_deadline(available_at, name: "available_at:"), metadata: {}} unless available_at.nil?
+
+      options =
+        case hold
+        when Symbol, String then {category: hold}
+        when Hash then hold.symbolize_keys
+        else raise ArgumentError, "hold: takes a category or a Hash of category:, until: and metadata:, not #{hold.inspect}"
+        end
+
+      unknown = options.keys - ARRIVAL_HOLD_OPTIONS
+      raise ArgumentError, "Unknown hold: options: #{unknown.join(", ")}" if unknown.any?
+      raise ArgumentError, "hold: needs a category" unless options.key?(:category)
+
+      {
+        category: options[:category],
+        releases_at: normalize_deadline(options[:until]),
+        metadata: normalize_metadata(options.fetch(:metadata, {}))
+      }
+    end
+
+    # The instant a deadline names, read the way Active Record reads it into
+    # a datetime column (strings and dates in Time.zone), so the instant a
+    # command checks is the instant it stores. Anything that is not a time is
+    # refused: stored, it would quietly mean "no deadline".
+    def normalize_deadline(value, name: "until:")
+      return if value.nil?
+
+      deadline = begin
+        value.in_time_zone if value.respond_to?(:in_time_zone)
+      rescue ArgumentError
+        nil
+      end
+
+      deadline || raise(ArgumentError, "#{name} must be a time, not #{value.inspect}")
+    end
+
+    # A deadline already reached would make a hold that is over before it
+    # starts: a caller error to surface, never a row to store.
+    def ensure_deadline_ahead!(releases_at)
+      return if releases_at.nil? || releases_at > evaluation_time
+
+      raise InvalidHold, "A hold's deadline must be in the future (until: #{releases_at.iso8601})"
+    end
+
+    # A ledger that did not opt in refuses every hold command here, before a
+    # single query runs.
+    def ensure_holds_enabled!
+      self.class.hold_class
+    end
+
+    def dispatch_hold_created!(hold, previous_balance:, new_balance:)
+      dispatch_callback(:hold_created,
+        wallet: self,
+        hold: hold,
+        amount: hold.amount,
+        category: hold.category,
+        previous_balance: previous_balance,
+        new_balance: new_balance,
+        metadata: hold.metadata)
     end
 
     # =========================================
@@ -773,21 +1084,23 @@ module Wallets
       value.to_s.strip.downcase
     end
 
-    def build_transfer_inbound_credit_specs(transfer:, outbound_transaction:, amount:, expiration_policy:, expires_at:)
+    def build_transfer_inbound_credit_specs(transfer:, allocations:, amount:, expiration_policy:, expires_at:)
       case expiration_policy
       when "none"
         [{amount: amount, expires_at: nil}]
       when "fixed"
         [{amount: amount, expires_at: expires_at}]
       when "preserve"
-        build_preserved_transfer_inbound_credit_specs(transfer, outbound_transaction, amount)
+        build_preserved_transfer_inbound_credit_specs(transfer, allocations, amount)
       else
         raise ArgumentError, "Unsupported transfer expiration policy: #{expiration_policy}"
       end
     end
 
-    def build_preserved_transfer_inbound_credit_specs(transfer, outbound_transaction, amount)
-      allocations = outbound_transaction.outgoing_allocations.includes(:source_transaction).order(:id).to_a
+    # Built from the allocations as the allocator made them, each holding the
+    # source row it locked. Never re-read: a plain read could answer from a
+    # stale snapshot that has never seen a bucket committed after it.
+    def build_preserved_transfer_inbound_credit_specs(transfer, allocations, amount)
       grouped_specs = []
 
       allocations.each do |allocation|
@@ -812,63 +1125,94 @@ module Wallets
     # Balance Calculation
     # =========================================
     #
-    # Every term takes the instant to evaluate at and whether to read current
-    # rows; both default to the pinned mutation context (see `evaluating_at`),
-    # so outside a mutation they read plainly at Time.current.
+    # Every term reads the pinned mutation context (see `evaluating_at`): the
+    # instant to evaluate at and whether to read current rows. Outside a
+    # mutation that is Time.current and plain reads.
 
-    # P: the remaining value of unexpired credits, held or not.
-    def positive_remaining_balance(at: evaluation_time, lock: current_reads?)
-      current_read(transactions.credits.not_expired(at: at), lock)
-        .sum(remaining_amount_sql(lock: lock))
+    # The terms of the balance at one instant: P (the remaining value of
+    # unexpired credits), C (the part of P an active hold covers), R (active
+    # reservations) and N (the debt no credit backs).
+    BalanceComponents = Struct.new(:positive, :covered, :reserved, :unbacked) do
+      def available
+        positive - covered - reserved - unbacked
+      end
+
+      def held
+        covered + reserved
+      end
+
+      def total
+        positive - unbacked
+      end
+    end
+    private_constant :BalanceComponents
+
+    # All four terms from ONE statement over this wallet's transactions, with
+    # R as a scalar subquery in the same statement. Separate statements would
+    # each see their own snapshot under read committed (PostgreSQL's
+    # default): a credit committed between two of them could count in P yet
+    # miss C. One statement is one snapshot, so available, held and total
+    # always agree. Ledgers that keep holds only: the others never query one.
+    def balance_components
+      at = evaluation_time
+      lock = current_reads?
+      credits = transaction_class.arel_table
+      unexpired_credit = credits[:amount].gt(0).and(credits[:expires_at].eq(nil).or(credits[:expires_at].gt(at))).to_sql(transaction_class)
+      debit = credits[:amount].lt(0).to_sql(transaction_class)
+      remaining = remaining_amount_sql(lock: lock)
+      reservations = current_read(wallet_holds.reservations.active(at: at), lock).select(hold_class.arel_table[:amount].sum)
+
+      terms = [
+        "COALESCE(SUM(CASE WHEN #{unexpired_credit} THEN #{remaining} ELSE 0 END), 0)",
+        "COALESCE(SUM(CASE WHEN #{unexpired_credit} AND #{self.class.coverage_sql(at: at, lock: lock)} THEN #{remaining} ELSE 0 END), 0)",
+        "(#{reservations.to_sql})",
+        "COALESCE(SUM(CASE WHEN #{debit} THEN #{unbacked_amount_sql(lock: lock)} ELSE 0 END), 0)"
+      ]
+
+      # An unsaved wallet has no ledger to read: every term is zero.
+      values = current_read(transactions, lock).pick(*terms.map { |sql| Arel.sql(sql) }) || []
+      BalanceComponents.new(*Array.new(terms.size) { |index| values[index].to_i })
+    end
+
+    # P: the remaining value of unexpired credits, held or not. Kept with its
+    # 0.3 signature and meaning (D12): embedders override it and call it.
+    def positive_remaining_balance
+      current_read(transactions.credits.not_expired(at: evaluation_time), current_reads?)
+        .sum(remaining_amount_sql)
         .to_i
     end
 
-    # N: the part of debits no credit backs.
-    def unbacked_negative_balance(transaction_scope = transactions.debits, lock: current_reads?)
-      connection = transaction_class.connection
-      txn_table = connection.quote_table_name(transaction_class.table_name)
-      alloc_table = connection.quote_table_name(allocation_class.table_name)
-      amount_column = connection.quote_column_name("amount")
-      id_column = connection.quote_column_name("id")
-      transaction_id_column = connection.quote_column_name("transaction_id")
-
-      current_read(transaction_scope, lock)
-        .sum("ABS(#{txn_table}.#{amount_column}) - (SELECT COALESCE(SUM(#{amount_column}), 0) FROM #{alloc_table} WHERE #{transaction_id_column} = #{txn_table}.#{id_column}#{locking_clause(lock)})")
+    # N: the part of debits no credit backs. Kept with its 0.3 signature and
+    # meaning (D12): usage_credits passes its own scope of debits.
+    def unbacked_negative_balance(transaction_scope = transactions.debits)
+      current_read(transaction_scope, current_reads?)
+        .sum(unbacked_amount_sql)
         .to_i
     end
 
-    # C: the remaining value of unexpired credits an active hold covers, each
-    # credit counted once however many reasons hold it.
-    def covered_remaining_balance(at: evaluation_time, lock: current_reads?)
-      return 0 unless holds_enabled?
+    # C and R, for telling a refused caller what holds keep out of reach.
+    def held_and_reserved
+      return [0, 0] unless holds_enabled?
 
-      current_read(transactions.credits.not_expired(at: at), lock)
-        .sum("CASE WHEN #{self.class.coverage_sql(at: at, lock: lock)} THEN #{remaining_amount_sql(lock: lock)} ELSE 0 END")
-        .to_i
+      components = balance_components
+      [components.covered, components.reserved]
     end
 
-    # R: the amounts of active reservations.
-    def reserved_balance(at: evaluation_time, lock: current_reads?)
-      return 0 unless holds_enabled?
-
-      current_read(wallet_holds.reservations.active(at: at), lock).sum(:amount).to_i
-    end
-
-    # The buckets a debit may consume at `at`: unexpired, and not covered by
-    # an active hold (none at all while a wallet hold is active). The one
+    # The buckets a debit may consume now: unexpired, and not covered by an
+    # active hold (none at all while a wallet hold is active). The one
     # eligibility definition behind both affordability (through C) and
     # allocation, so the two can never disagree.
-    def eligible_credits(at: evaluation_time, lock: current_reads?)
-      credits = transactions.credits.not_expired(at: at)
+    def eligible_credits
+      credits = transactions.credits.not_expired(at: evaluation_time)
       return credits unless holds_enabled?
 
-      credits.where("NOT #{self.class.coverage_sql(at: at, lock: lock)}")
+      credits.where("NOT #{self.class.coverage_sql(at: evaluation_time, lock: current_reads?)}")
     end
 
     # P - C: what FEFO allocation can take from eligible buckets right now.
-    def eligible_remaining_balance(at: evaluation_time, lock: current_reads?)
-      current_read(eligible_credits(at: at, lock: lock), lock)
-        .sum(remaining_amount_sql(lock: lock))
+    def eligible_remaining_balance
+      current_read(eligible_credits, current_reads?)
+        .sum(remaining_amount_sql)
         .to_i
     end
 
@@ -885,6 +1229,18 @@ module Wallets
       "#{txn_table}.#{amount_column} - (SELECT COALESCE(SUM(#{amount_column}), 0) FROM #{alloc_table} WHERE #{source_transaction_id_column} = #{txn_table}.#{id_column}#{locking_clause(lock)})"
     end
 
+    # A debit's unbacked value: its size minus what credits allocated to it.
+    def unbacked_amount_sql(lock: current_reads?)
+      connection = transaction_class.connection
+      txn_table = connection.quote_table_name(transaction_class.table_name)
+      alloc_table = connection.quote_table_name(allocation_class.table_name)
+      amount_column = connection.quote_column_name("amount")
+      id_column = connection.quote_column_name("id")
+      transaction_id_column = connection.quote_column_name("transaction_id")
+
+      "ABS(#{txn_table}.#{amount_column}) - (SELECT COALESCE(SUM(#{amount_column}), 0) FROM #{alloc_table} WHERE #{transaction_id_column} = #{txn_table}.#{id_column}#{locking_clause(lock)})"
+    end
+
     def wallet_holds
       hold_class.where(wallet_id: id)
     end
@@ -893,16 +1249,56 @@ module Wallets
     # any cache it can go stale through time alone (expiry, lapsed deadlines),
     # so it is never authoritative for accounting.
     #
-    # The row is written even when the balance did not move (a second reason
-    # on a held credit, a capture of a whole reservation): every committed
-    # change to the ledger must change the wallet row, which is how
-    # `stale_snapshot?` knows a snapshot is current (and how PostgreSQL's
-    # repeatable read detects a concurrent update on `lock!`).
+    # The row is written every time, with a strictly later `updated_at`, even
+    # when the balance did not move (a second reason on a held credit, a
+    # capture of a whole reservation): every committed change to the ledger
+    # must change the wallet row, which is how `stale_snapshot?` knows a
+    # snapshot is current (and how PostgreSQL's repeatable read detects a
+    # concurrent update on `lock!`). Hence `update_column` rather than
+    # `touch`, which writes nothing under `no_touching`.
+    #
+    # `update!` rather than assigning and then saving: if the command's
+    # savepoint rolls back afterwards, Active Record restores the wallet as it
+    # was when the write began, and that must be the clean wallet, never one
+    # with the new balance pending (which no later command could lock).
     def refresh_cached_balance!
       available = current_balance
-      write_attribute(:balance, available)
-      has_changes_to_save? ? save! : touch
+      marker = next_row_marker
+
+      if available == read_attribute(:balance)
+        update_column(:updated_at, marker)
+      else
+        refreshing_cached_balance { update!(balance: available, updated_at: marker) }
+      end
+
       available
+    end
+
+    # The wallet row's next `updated_at`: the command's instant, or one
+    # microsecond past the current marker when the clock has not moved past
+    # it (two commands within a microsecond, a frozen clock), so no two
+    # commits ever leave the same row behind. Assumes the column keeps
+    # microseconds, as `t.timestamps` does from Rails 7 on (datetime(6)); a
+    # column truncating to whole seconds could repeat a marker.
+    def next_row_marker
+      now = evaluation_time
+      now = now.change(usec: now.usec) # the column's precision
+      return now if updated_at.nil?
+
+      [now, updated_at + MARKER_STEP].max
+    end
+
+    def refreshing_cached_balance
+      @refreshing_cached_balance = true
+      yield
+    ensure
+      @refreshing_cached_balance = false
+    end
+
+    def remember_own_write
+      return if @refreshing_cached_balance || !self.class.current_reads_need_locks?
+
+      remember_stale_snapshot!
     end
 
     # =========================================
@@ -913,8 +1309,7 @@ module Wallets
     # about to roll back), and names what holds keep out of reach, so the app
     # can say "20 available, 30 held, 50 reserved" rather than just "20".
     def reject_insufficient_balance!(amount, available, metadata)
-      held = covered_remaining_balance
-      reserved = reserved_balance
+      held, reserved = held_and_reserved
       dispatch_insufficient_balance!(amount, available, metadata, held: held, reserved: reserved)
 
       details = {held: held, reserved: reserved}.reject { |_name, value| value.zero? }.map { |name, value| "#{value} #{name}" }
@@ -923,7 +1318,9 @@ module Wallets
 
     # `held:` is the credit value holds cover and `reserved:` the active
     # reservations, so available + held + reserved is the total balance.
-    def dispatch_insufficient_balance!(amount, previous_balance, metadata, held: covered_remaining_balance, reserved: reserved_balance)
+    def dispatch_insufficient_balance!(amount, previous_balance, metadata, held: nil, reserved: nil)
+      held, reserved = held_and_reserved if held.nil? || reserved.nil?
+
       dispatch_callback(:insufficient,
         wallet: self,
         amount: amount,

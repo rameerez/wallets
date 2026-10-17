@@ -22,7 +22,9 @@ module Wallets
       :on_transfer_completed_callback,
       :on_low_balance_reached_callback,
       :on_balance_depleted_callback,
-      :on_insufficient_balance_callback
+      :on_insufficient_balance_callback,
+      :on_hold_created_callback,
+      :on_hold_released_callback
 
     def initialize
       # Keep the out-of-the-box default close to the most common "main wallet"
@@ -42,6 +44,8 @@ module Wallets
       @on_low_balance_reached_callback = nil
       @on_balance_depleted_callback = nil
       @on_insufficient_balance_callback = nil
+      @on_hold_created_callback = nil
+      @on_hold_released_callback = nil
     end
 
     def default_asset=(value)
@@ -104,6 +108,14 @@ module Wallets
 
     def on_insufficient_balance(&block)
       @on_insufficient_balance_callback = block
+    end
+
+    def on_hold_created(&block)
+      @on_hold_created_callback = block
+    end
+
+    def on_hold_released(&block)
+      @on_hold_released_callback = block
     end
 
     private

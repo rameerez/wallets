@@ -257,4 +257,338 @@ class WalletCallbacksTest < ActiveSupport::TestCase
     assert_equal 7, inbound.balance_before
     assert_equal 47, inbound.balance_after
   end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # A command's savepoint decides its callbacks
+  # ───────────────────────────────────────────────────────────────────────────
+  #
+  # Every command runs in its own savepoint and queues its success callbacks
+  # on it: a failure later in the command rolls the savepoint back and drops
+  # them, even when the caller rescues and commits its own transaction.
+
+  SUCCESS_EVENTS = %i[balance_credited balance_debited transfer_completed hold_created hold_released low_balance_reached balance_depleted].freeze
+
+  test "a transfer whose inbound leg fails leaves nothing behind and reports nothing, even when the caller rescues and commits" do
+    Wallets.configuration.low_balance_threshold = 50
+    sender = create_wallet(users(:new_user), asset_code: :legs, initial_balance: 100)
+    recipient = create_wallet(users(:peer_user), asset_code: :legs)
+    events = record(*SUCCESS_EVENTS)
+    recipient.stubs(:apply_credit).raises(ActiveRecord::StatementInvalid, "the inbound leg failed")
+
+    Wallets::Wallet.transaction do
+      assert_raises(ActiveRecord::StatementInvalid) { sender.transfer_to(recipient, 60, category: :peer_payment) }
+      Wallets::Wallet.find(recipient.id).balance # the caller's transaction carries on
+    end
+
+    assert_empty events, "the outbound debit and its low-balance crossing were reported"
+    assert_empty Wallets::Transfer.where(from_wallet_id: sender.id)
+    assert_empty sender.transactions.debits
+    assert_empty Wallets::Allocation.where(source_transaction_id: sender.transactions.select(:id))
+    assert_equal 100, Wallets::Wallet.find(sender.id).read_attribute(:balance), "the cached balance is untouched"
+    refute sender.has_changes_to_save?, "the sender can run its next command"
+    assert_equal 100, sender.debit(10, category: :purchase).balance_before
+  end
+
+  test "a credit that fails after reporting itself reports nothing, even when the caller rescues and commits" do
+    wallet = create_wallet(users(:new_user), asset_code: :late_failure)
+    events = record(*SUCCESS_EVENTS)
+    wallet.stubs(:dispatch_hold_created!).raises(ActiveRecord::StatementInvalid, "failed after balance_credited was queued")
+
+    Wallets::Wallet.transaction do
+      assert_raises(ActiveRecord::StatementInvalid) { wallet.credit(751, category: :reward, hold: :pending_validation) }
+    end
+
+    assert_empty events
+    assert_empty Wallets::Transaction.where(wallet_id: wallet.id)
+  end
+
+  test "a hold that fails after reporting itself reports nothing, even when the caller rescues and commits" do
+    Wallets.configuration.low_balance_threshold = 10
+    wallet = create_wallet(users(:new_user), asset_code: :late_failure, initial_balance: 100)
+    events = record(*SUCCESS_EVENTS)
+    wallet.stubs(:dispatch_balance_threshold_callbacks!).raises(ActiveRecord::StatementInvalid, "failed after hold_created was queued")
+
+    Wallets::Wallet.transaction do
+      # The same wallet object carries on after each failure: a rolled-back
+      # command leaves it clean, never with a refreshed balance pending.
+      assert_raises(ActiveRecord::StatementInvalid) { wallet.hold(category: :chargeback) }
+      assert_raises(ActiveRecord::StatementInvalid) { wallet.reserve(10, category: :booking) }
+      assert_raises(ActiveRecord::StatementInvalid) { wallet.debit(10, category: :purchase) }
+      refute wallet.has_changes_to_save?
+    end
+
+    assert_empty events
+    assert_empty Wallets::Hold.where(wallet_id: wallet.id)
+    assert_empty Wallets::Transaction.where(wallet_id: wallet.id).debits
+    assert_equal 100, wallet.reload.read_attribute(:balance)
+  end
+
+  test "every command's success callbacks are dropped when an enclosing transaction rolls back" do
+    sender = create_wallet(users(:new_user), asset_code: :rolled_back, initial_balance: 100)
+    recipient = create_wallet(users(:peer_user), asset_code: :rolled_back)
+    standing = sender.hold(category: :chargeback, until: 1.day.from_now)
+    events = record(*SUCCESS_EVENTS)
+
+    Wallets::Wallet.transaction do
+      standing.release!
+      sender.credit(10, category: :reward, hold: :pending_validation)
+      sender.debit(10, category: :purchase)
+      sender.reserve(10, category: :booking)
+      sender.transfer_to(recipient, 10, category: :peer_payment)
+      sender.hold(category: :chargeback)
+      raise ActiveRecord::Rollback
+    end
+
+    assert_empty events
+    assert Wallets::Hold.find(standing.id).active?
+    assert_equal [0, 100, 0], [sender.reload.balance, sender.total_balance, recipient.reload.total_balance]
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Holds and reservations
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "hold_created reports a credit hold with its creation metadata" do
+    events = record(:hold_created)
+    wallet = create_wallet(users(:new_user), asset_code: :held)
+    credit = wallet.credit(100, category: :reward)
+    wallet.credit(50, category: :top_up)
+
+    hold = wallet.hold(credit, category: :fraud_review, metadata: {case_id: 42})
+
+    context = events.sole
+    assert_equal :hold_created, context.event
+    assert_equal hold, context.hold
+    assert_same wallet, context.wallet
+    assert_equal users(:new_user), context.owner
+    assert_equal "fraud_review", context.category
+    assert_nil context.amount, "a coverage hold has no amount"
+    assert_equal 150, context.previous_balance
+    assert_equal 50, context.new_balance
+    assert_equal 42, context.metadata[:case_id]
+    assert_nil context.transaction
+    assert_equal %i[event wallet previous_balance new_balance category metadata hold].sort, context.to_h.keys.sort
+  end
+
+  test "hold_created reports a reservation with its amount" do
+    events = record(:hold_created)
+    wallet = create_wallet(users(:new_user), asset_code: :held, initial_balance: 100)
+
+    reservation = wallet.reserve(30, category: :booking, metadata: {booking_id: 9})
+
+    context = events.sole
+    assert_equal reservation, context.hold
+    assert_equal 30, context.amount
+    assert_equal "booking", context.category
+    assert_equal [100, 70], [context.previous_balance, context.new_balance]
+    assert_equal 9, context.metadata[:booking_id]
+  end
+
+  test "hold_created reports a wallet hold" do
+    events = record(:hold_created)
+    wallet = create_wallet(users(:new_user), asset_code: :held, initial_balance: 100)
+
+    hold = wallet.hold(category: :chargeback)
+
+    assert_equal hold, events.sole.hold
+    assert_equal [100, 0], [events.sole.previous_balance, events.sole.new_balance]
+    assert_equal({}, events.sole.metadata)
+  end
+
+  test "hold_released reports the release metadata, never the creation metadata" do
+    events = record(:hold_released)
+    wallet = create_wallet(users(:new_user), asset_code: :held)
+    credit = wallet.credit(100, category: :reward)
+    hold = wallet.hold(credit, category: :fraud_review, metadata: {case_id: 42})
+
+    hold.release!(reason: "cleared_by_operator", metadata: {actor_id: 12})
+
+    context = events.sole
+    assert_equal :hold_released, context.event
+    assert_equal hold, context.hold
+    assert_equal wallet, context.wallet
+    assert_equal [0, 100], [context.previous_balance, context.new_balance]
+    assert_equal({"actor_id" => 12}, context.metadata)
+    assert_equal "cleared_by_operator", context.hold.release_reason
+    assert_nil context.transaction, "only a capture names a debit"
+    assert_nil context.amount
+  end
+
+  test "an idempotent release reports nothing" do
+    events = record(:hold_released)
+    wallet = create_wallet(users(:new_user), asset_code: :held, initial_balance: 100)
+    released = wallet.hold(category: :chargeback)
+    released.release!
+    lapsed = wallet.hold(category: :chargeback, until: 1.day.from_now)
+
+    travel 2.days do
+      released.release!
+      lapsed.release!
+    end
+
+    assert_equal 1, events.size
+  end
+
+  test "hold callbacks wait for the outermost commit" do
+    events = record(:hold_created, :hold_released)
+    wallet = create_wallet(users(:new_user), asset_code: :held, initial_balance: 100)
+
+    Wallets::Wallet.transaction do
+      reservation = wallet.reserve(30, category: :booking)
+      wallet.hold(category: :chargeback)
+      reservation.release!
+
+      assert_empty events, "nothing is reported before the caller's transaction commits"
+    end
+
+    assert_equal %i[hold_created hold_created hold_released], events.map(&:event)
+  end
+
+  test "hold callbacks are dropped when an enclosing transaction rolls back" do
+    events = record(:hold_created, :hold_released, :balance_credited)
+    wallet = create_wallet(users(:new_user), asset_code: :held, initial_balance: 100)
+    standing = wallet.hold(category: :chargeback)
+    events.clear
+
+    Wallets::Wallet.transaction do
+      standing.release!
+      wallet.reserve(30, category: :booking)
+      wallet.credit(10, category: :reward, hold: :pending_validation)
+      raise ActiveRecord::Rollback
+    end
+
+    assert_empty events
+    assert_equal [standing.id], Wallets::Hold.where(wallet: wallet).pluck(:id)
+    assert Wallets::Hold.find(standing.id).active?
+  end
+
+  test "a credit arriving held reports the finished operation, never a spendable instant" do
+    events = record(:balance_credited, :hold_created, :low_balance_reached, :balance_depleted)
+    Wallets.configuration.low_balance_threshold = 50
+    wallet = create_wallet(users(:new_user), asset_code: :held, initial_balance: 10)
+    events.clear
+
+    credit = wallet.credit(751, category: :reward, metadata: {ride_id: 1}, hold: {category: :pending_validation, metadata: {case: "c-1"}})
+
+    assert_equal %i[balance_credited hold_created], events.map(&:event)
+    credited, created = events
+    assert_equal credit, credited.transaction
+    assert_equal 751, credited.amount
+    assert_equal [10, 10], [credited.previous_balance, credited.new_balance]
+    assert_equal 1, credited.metadata[:ride_id]
+    assert_equal credit.holds.sole, created.hold
+    assert_equal [10, 10], [created.previous_balance, created.new_balance]
+    assert_equal "c-1", created.metadata[:case]
+  end
+
+  test "a credit that cannot get its hold reports nothing, even when the caller rescues and commits" do
+    events = record(:balance_credited, :hold_created)
+    wallet = create_wallet(users(:new_user), asset_code: :held)
+
+    Wallets::Wallet.transaction do
+      assert_raises(ActiveRecord::RecordInvalid) { wallet.credit(751, category: :reward, hold: {category: ""}) }
+    end
+
+    assert_empty events
+  end
+
+  test "a hold that crosses a threshold reports the crossing once" do
+    events = record(:low_balance_reached, :balance_depleted)
+    Wallets.configuration.low_balance_threshold = 100
+    wallet = create_wallet(users(:new_user), asset_code: :held)
+    held = wallet.credit(100, category: :reward)
+    wallet.credit(50, category: :top_up)
+
+    wallet.hold(held, category: :fraud_review) # 150 -> 50: low
+    wallet.hold(held, category: :dispute)      # 50 -> 50: another reason moves nothing
+    wallet.hold(category: :chargeback)         # 50 -> 0: depleted, already low
+
+    assert_equal %i[low_balance_reached balance_depleted], events.map(&:event)
+    assert_equal [150, 50], [events.first.previous_balance, events.first.new_balance]
+    assert_equal 100, events.first.threshold
+    assert_equal [50, 0], [events.second.previous_balance, events.second.new_balance]
+  end
+
+  test "a reservation that crosses both thresholds reports each once" do
+    events = record(:low_balance_reached, :balance_depleted)
+    Wallets.configuration.low_balance_threshold = 20
+    wallet = create_wallet(users(:new_user), asset_code: :held, initial_balance: 100)
+
+    wallet.reserve(100, category: :booking)
+
+    assert_equal %i[low_balance_reached balance_depleted], events.map(&:event)
+    assert events.all? { |context| [context.previous_balance, context.new_balance] == [100, 0] }
+  end
+
+  test "a hold over value that is already held crosses nothing" do
+    events = record(:low_balance_reached, :balance_depleted)
+    Wallets.configuration.low_balance_threshold = 10
+    wallet = create_wallet(users(:new_user), asset_code: :held, initial_balance: 100)
+    wallet.hold(category: :chargeback)
+    events.clear
+
+    wallet.hold(wallet.transactions.credits.sole, category: :fraud_review)
+    wallet.credit(30, category: :reward, hold: :pending_validation)
+
+    assert_empty events
+  end
+
+  test "a release crosses no threshold, and the next hold crosses again" do
+    events = record(:low_balance_reached, :balance_depleted)
+    Wallets.configuration.low_balance_threshold = 10
+    wallet = create_wallet(users(:new_user), asset_code: :held, initial_balance: 100)
+    hold = wallet.hold(category: :chargeback)
+    assert_equal 2, events.size
+
+    hold.release!
+    assert_equal 2, events.size, "giving value back reports no threshold"
+
+    wallet.hold(category: :chargeback)
+    assert_equal 4, events.size, "a fresh crossing is reported again"
+  end
+
+  test "insufficient_balance fires immediately for a rejected reservation, naming what is held and reserved" do
+    events = record(:insufficient_balance, :hold_created)
+    wallet = create_wallet(users(:new_user), asset_code: :held, initial_balance: 100)
+    wallet.hold(wallet.credit(50, category: :reward), category: :fraud_review)
+    wallet.reserve(60, category: :booking)
+    events.clear
+
+    Wallets::Wallet.transaction do
+      assert_raises(Wallets::InsufficientBalance) { wallet.reserve(41, category: :booking, metadata: {booking_id: 9}) }
+      raise ActiveRecord::Rollback
+    end
+
+    context = events.sole
+    assert_equal :insufficient_balance, context.event
+    assert_equal 41, context.amount
+    assert_equal [40, 40], [context.previous_balance, context.new_balance]
+    assert_equal({available: 40, required: 41, held: 50, reserved: 60, booking_id: 9}, context.metadata.symbolize_keys)
+  end
+
+  test "a ledger may leave hold events unmapped" do
+    silent = Class.new(Wallets::Wallet) do
+      def self.name
+        "SilentHoldsWallet"
+      end
+
+      self.callback_event_map = callback_event_map.merge(hold_created: nil, hold_released: nil).freeze
+    end
+    events = record(:hold_created, :hold_released)
+    wallet = silent.find(create_wallet(users(:new_user), asset_code: :held, initial_balance: 100).id)
+
+    wallet.hold(category: :chargeback).release!
+
+    assert_empty events
+    assert_equal 100, wallet.balance
+  end
+
+  private
+
+  # Every context dispatched for the given events, in order.
+  def record(*events)
+    contexts = []
+    events.each { |event| Wallets.configuration.public_send(:"on_#{event}") { |context| contexts << context } }
+    contexts
+  end
 end

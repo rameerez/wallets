@@ -42,6 +42,19 @@ class Wallets::CallbacksTest < ActiveSupport::TestCase
     Wallets::Callbacks.dispatch(:balance_debited, wallet: wallets_wallets(:rich_coins_wallet))
   end
 
+  test "dispatch reaches the hold callbacks" do
+    events = []
+    Wallets.configure do |config|
+      config.on_hold_created { |context| events << context.event }
+      config.on_hold_released { |context| events << context.event }
+    end
+
+    Wallets::Callbacks.dispatch(:hold_created, wallet: wallets_wallets(:rich_coins_wallet))
+    Wallets::Callbacks.dispatch(:hold_released, wallet: wallets_wallets(:rich_coins_wallet))
+
+    assert_equal %i[hold_created hold_released], events
+  end
+
   test "dispatch ignores unknown events instead of raising" do
     assert_nothing_raised do
       Wallets::Callbacks.dispatch(:made_up_event, wallet: wallets_wallets(:rich_coins_wallet))

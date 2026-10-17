@@ -226,7 +226,7 @@ class Wallets::HoldTest < ActiveSupport::TestCase
     refute released.active?
   end
 
-  test "coverage, reservations, for_wallet_scope and credit_scoped split holds by shape" do
+  test "coverage, reservations, wallet_scoped and credit_scoped split holds by shape" do
     credit_hold = hold!(@wallet, @credit)
     wallet_hold = hold!(@wallet)
     reservation = reservation!(@wallet, 25)
@@ -234,9 +234,9 @@ class Wallets::HoldTest < ActiveSupport::TestCase
 
     assert_equal [credit_hold, wallet_hold].map(&:id).sort, holds.coverage.pluck(:id).sort
     assert_equal [reservation.id], holds.reservations.pluck(:id)
-    assert_equal [wallet_hold, reservation].map(&:id).sort, holds.for_wallet_scope.pluck(:id).sort
+    assert_equal [wallet_hold, reservation].map(&:id).sort, holds.wallet_scoped.pluck(:id).sort
     assert_equal [credit_hold.id], holds.credit_scoped.pluck(:id)
-    assert_equal [wallet_hold.id], holds.coverage.for_wallet_scope.pluck(:id)
+    assert_equal [wallet_hold.id], holds.coverage.wallet_scoped.pluck(:id)
   end
 
   test "scopes stay qualified when joined with a table that shares their column names" do

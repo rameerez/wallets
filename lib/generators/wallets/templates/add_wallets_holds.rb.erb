@@ -52,8 +52,19 @@ class AddWalletsHolds < ActiveRecord::Migration<%= migration_version %>
     end
   end
 
+  # Rolling back must never delete holds, including holds this migration did
+  # not create (its `up` is a no-op when the table already exists). An empty
+  # table goes; one with rows stays, and says so.
   def down
-    drop_table holds_table, if_exists: true
+    return unless table_exists?(holds_table)
+
+    if select_value("SELECT 1 FROM #{quote_table_name(holds_table)} LIMIT 1")
+      raise ActiveRecord::IrreversibleMigration,
+        "#{holds_table} still has holds, and rolling back would delete them. " \
+        "Drop the table deliberately if that is what you mean."
+    end
+
+    drop_table holds_table
   end
 
   private

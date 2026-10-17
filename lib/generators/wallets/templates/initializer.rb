@@ -61,6 +61,14 @@ Wallets.configure do |config|
   #   on_balance_depleted      - When a debit drives balance from positive
   #                              to zero or below (one-shot per crossing)
   #   on_insufficient_balance  - When a debit or transfer is rejected
+  #   on_hold_created          - After a hold or a reservation is placed
+  #   on_hold_released         - After hold.release! ends a hold (a deadline
+  #                              passing is computed, never announced)
+  #
+  # Balances work like a bank statement: wallet.balance is the AVAILABLE
+  # balance (what can be spent now), wallet.held_balance is what holds and
+  # reservations keep pending, and wallet.total_balance is both together.
+  # previous_balance and new_balance always report the available balance.
   #
   # Context object properties (available depending on event):
   #   ctx.event            # Symbol - the event name
@@ -71,7 +79,8 @@ Wallets.configure do |config|
   #   ctx.new_balance      # Balance after the operation
   #   ctx.transaction      # The Wallets::Transaction record
   #   ctx.transfer         # The Wallets::Transfer record
-  #   ctx.category         # Transaction category
+  #   ctx.hold             # The Wallets::Hold record (hold events)
+  #   ctx.category         # Transaction category (the hold's on hold events)
   #   ctx.threshold        # Low balance threshold
   #   ctx.metadata         # Additional event-specific context
   #   ctx.to_h             # Hash representation without nil values
@@ -93,5 +102,9 @@ Wallets.configure do |config|
   #
   # config.on_insufficient_balance do |ctx|
   #   Rails.logger.info "[Wallets] #{ctx.owner.class}##{ctx.owner.id} needs #{ctx.amount}, has #{ctx.metadata[:available]}"
+  # end
+  #
+  # config.on_hold_created do |ctx|
+  #   Rails.logger.info "[Wallets] #{ctx.category} hold on #{ctx.owner.class}##{ctx.owner.id}, available #{ctx.new_balance}"
   # end
 end
