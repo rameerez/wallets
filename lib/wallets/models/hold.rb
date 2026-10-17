@@ -18,10 +18,12 @@ module Wallets
   # passes (`releases_at`). Deadlines are computed, never swept, exactly like
   # `expires_at`: at the deadline itself the hold is already inactive.
   #
-  # A row validates only what it can see on itself. Rules that span records
-  # (the credit belongs to this wallet and still has value, the wallet can
-  # fund a reservation) are enforced by the wallet's commands under the wallet
-  # lock, where they cannot race.
+  # A row validates what it can see on itself, plus the one link it must
+  # never carry wrongly: a capture must name a debit of its own wallet no
+  # larger than the reservation. Every other rule that spans records (the
+  # credit belongs to this wallet and still has value, the wallet can fund a
+  # reservation) is enforced by the wallet's commands under the wallet lock,
+  # where they cannot race.
   #
   # This class supports embedding: subclasses can override config and table
   # names without affecting the base Wallets::* behavior.
