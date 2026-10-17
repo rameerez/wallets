@@ -289,24 +289,51 @@ class Wallets::TargetedDebitTest < ActiveSupport::TestCase
     assert_equal [[second.id, 10], [first.id, 5]], allocations(spend)
   end
 
-  test "an expired credit is refused, from the exact instant it expires, even beside credits that would do" do
+  test "an expired credit gives nothing, from the exact instant it expires, like a spent one" do
     freeze_time
     wallet = points_wallet
     expiring = wallet.credit(100, category: :reward, expires_at: 1.day.from_now)
     evergreen = wallet.credit(100, category: :top_up)
 
     travel_to(1.day.from_now) do
-      [expiring, [evergreen, expiring]].each do |from|
-        assert_nothing_written(wallet) do
-          error = assert_raises(ArgumentError) { wallet.debit(10, category: :purchase, from: from) }
-          assert_equal "Credit #{expiring.id} has expired", error.message
-        end
+      assert_nothing_written(wallet) do
+        error = assert_raises(Wallets::InsufficientBalance) { wallet.debit(10, category: :purchase, from: expiring) }
+        assert_equal "Insufficient balance (0 < 10 in the named credits)", error.message
+      end
+
+      [[expiring, evergreen], [evergreen, expiring]].each do |from|
+        spend = wallet.debit(10, category: :purchase, from: from)
+        assert_equal [[evergreen.id, 10]], allocations(spend), "the expired credit is passed over"
       end
     end
 
     travel_to(1.day.from_now - 1.second) do
       assert_equal [[expiring.id, 10]], allocations(wallet.debit(10, category: :purchase, from: expiring))
     end
+  end
+
+  test "no allocation ever points at an expired named credit, so no value is created from it" do
+    freeze_time
+    Wallets.configuration.allow_negative_balance = true # and no falling back to debt either
+    sender = points_wallet
+    expired = sender.credit(100, category: :reward, expires_at: 1.day.from_now, hold: :fraud_review)
+    live = sender.credit(30, category: :top_up)
+    recipient = create_wallet(users(:peer_user), asset_code: :points)
+    travel 1.day
+
+    sender.debit(10, category: :purchase, from: [expired, live])
+    sender.transfer_to(recipient, 20, category: :peer_payment, from: [live, expired])
+    assert_raises(Wallets::InsufficientBalance) { sender.debit(1, category: :purchase, from: [expired, live]) }
+    [{}, {expiration_policy: :none}, {expires_at: 10.days.from_now}].each do |policy|
+      assert_raises(Wallets::InsufficientBalance) { sender.transfer_to(recipient, 1, category: :peer_payment, from: expired, **policy) }
+    end
+
+    assert_empty Wallets::Allocation.where(source_transaction_id: expired.id)
+    assert_equal 100, expired.reload.remaining_amount, "what it held when it expired, untouched"
+    assert_equal 0, live.reload.remaining_amount
+    assert sender.transactions.debits.all? { |debit| debit.unbacked_amount.zero? }
+    assert_equal [0, 0, 0], balances(sender)
+    assert_equal [20, 0, 20], balances(recipient), "the recipient got only what the live credit gave"
   end
 
   test "a targeted debit decides expiry at the instant it sampled under the lock" do
@@ -423,25 +450,32 @@ class Wallets::TargetedDebitTest < ActiveSupport::TestCase
     assert_equal 20, credit.reload.remaining_amount
   end
 
-  test "a targeted transfer refuses an expired source under every expiration policy, before any row is written" do
+  test "a targeted transfer passes over an expired source under every expiration policy" do
     freeze_time
     sender = points_wallet
     expiring = sender.credit(100, category: :reward, expires_at: 1.day.from_now)
-    sender.credit(100, category: :top_up)
+    evergreen = sender.credit(100, category: :top_up)
     recipient = create_wallet(users(:peer_user), asset_code: :points)
 
     travel_to(1.day.from_now) do
       [{}, {expiration_policy: :preserve}, {expiration_policy: :none}, {expires_at: 10.days.from_now}].each do |policy|
         assert_no_difference -> { Wallets::Transfer.count } do
           assert_nothing_written(sender) do
-            error = assert_raises(ArgumentError, "#{policy.inspect} must refuse an expired source") do
+            error = assert_raises(Wallets::InsufficientBalance, "#{policy.inspect}: an expired source alone funds nothing") do
               sender.transfer_to(recipient, 10, category: :peer_payment, from: expiring, **policy)
             end
-            assert_equal "Credit #{expiring.id} has expired", error.message
+            assert_equal "Insufficient balance (0 < 10 in the named credits)", error.message
           end
         end
+
+        transfer = sender.transfer_to(recipient, 10, category: :peer_payment, from: [expiring, evergreen], **policy)
+        assert_equal [[evergreen.id, 10]], allocations(transfer.outbound_transaction), "#{policy.inspect}: only the live source funds it"
+        assert_equal 10, transfer.inbound_transactions.sum(:amount)
       end
     end
+
+    assert_equal 100, expiring.reload.remaining_amount
+    assert_equal 40, recipient.balance
   end
 
   test "a targeted transfer is funded like a targeted debit, and a refusal writes no transfer" do

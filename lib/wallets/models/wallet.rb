@@ -1027,9 +1027,10 @@ module Wallets
 
     # The credits `from:` names, as far as they can be checked without the
     # ledger: one saved credit of this ledger, or a list of distinct ones, in
-    # the caller's order. nil when `from:` was left out. Whose they are, and
-    # whether they are unexpired credits, is read under the wallet lock (see
-    # `named_buckets!`), never taken from the caller's copies.
+    # the caller's order. nil when `from:` was left out. Whose they are,
+    # whether they are credits, and what they have left to give is read under
+    # the wallet lock (see `named_buckets!`), never taken from the caller's
+    # copies.
     def named_credits(from)
       return if from.equal?(ELIGIBLE_CREDITS)
 
@@ -1057,11 +1058,14 @@ module Wallets
     # the buckets to allocate from; raises otherwise, before anything is
     # written.
     #
-    # - Every one is a credit of this wallet, unexpired at this instant:
-    #   allocating from an expired credit would hand on value that no longer
-    #   exists, whatever a transfer's expiration policy.
-    # - Together they hold at least `amount`: a targeted debit is allocated
-    #   to them in full, never to other credits and never to debt.
+    # - Every one is a credit of this wallet; anything else is a wrong
+    #   argument (ArgumentError), like `hold` draws it.
+    # - A credit expired at this instant has nothing left to give, exactly
+    #   like a spent one, so it is passed over and never allocated from:
+    #   handing on its value would create value that no longer exists,
+    #   whatever a transfer's expiration policy.
+    # - Together the rest hold at least `amount`: a targeted debit is
+    #   allocated to them in full, never to other credits and never to debt.
     # - With overdrafts off, the part they give from unheld value must fit in
     #   the available balance, floored at zero. Held value is not part of
     #   the available balance, so taking it needs no funding; unheld value
@@ -1091,7 +1095,9 @@ module Wallets
 
     # One locked statement, like the buckets an ordinary debit walks: each
     # named credit with its remaining value and whether an active hold covers
-    # it, all at this instant and as the rows are now.
+    # it, all at this instant and as the rows are now. The expired ones are
+    # left out: their remaining value is what they held, not what they can
+    # still give.
     def locked_named_buckets(credits)
       at = evaluation_time
       rows = transactions.where(id: credits.map(&:id))
@@ -1103,12 +1109,11 @@ module Wallets
         .lock("FOR UPDATE")
         .index_by(&:id)
 
-      credits.map do |credit|
+      credits.filter_map do |credit|
         row = rows[credit.id] || raise(ArgumentError, missing_credit_message(credit))
         raise ArgumentError, "Transaction #{credit.id} is a debit: only credits can fund a targeted debit" unless row.credit?
-        raise ArgumentError, "Credit #{credit.id} has expired" if row.expired?(at: at)
 
-        row
+        row unless row.expired?(at: at)
       end
     end
 
@@ -1179,11 +1184,18 @@ module Wallets
     # never existed), and a retry that checks `active?` or `captured?` first
     # would never run. If even that read fails, the original error is the
     # one worth raising.
+    #
+    # It is a current read, locking where plain reads may answer from an
+    # older snapshot (MySQL, see `current_reads_need_locks?`). A plain one
+    # there would undo what the command's own locking read had just shown:
+    # a capture refused because another connection captured first would
+    # leave the copy reading uncaptured again. It locks the hold's row by
+    # its primary key, no range, until the caller's transaction ends.
     def ending_hold(hold, &block)
       with_lock(requires_new: true, &block)
     rescue => error
       begin
-        hold.reload
+        hold.reload(lock: self.class.current_reads_need_locks?)
       rescue ActiveRecord::ActiveRecordError
         nil
       end
@@ -1264,19 +1276,24 @@ module Wallets
     # ledger, still unexpired at the command's instant, with value left to
     # hold. Read from the database under the wallet lock, never from the
     # caller's copy, so a debit that just spent it is seen.
+    #
+    # The same line as `from:` draws: anything that is not a credit of this
+    # wallet is a wrong argument (ArgumentError); a credit of this wallet
+    # that the ledger's state rules out, expired or spent at this instant,
+    # is a hold that cannot be placed now (InvalidHold).
     def ensure_holdable!(credit)
       unless credit.instance_of?(transaction_class)
-        raise InvalidHold, "A hold covers a #{transaction_class.name}, not #{credit.class.name}"
+        raise ArgumentError, "A hold covers a #{transaction_class.name}, not #{credit.class.name}"
       end
-      raise InvalidHold, "Only a saved credit can be held" unless credit.persisted?
+      raise ArgumentError, "Only a saved credit can be held" unless credit.persisted?
 
       row = current_read(transaction_class.where(id: credit.id), current_reads?)
         .pick(:wallet_id, :amount, :expires_at, Arel.sql(remaining_amount_sql))
-      raise InvalidHold, "Transaction #{credit.id} no longer exists" if row.nil?
+      raise ArgumentError, "Transaction #{credit.id} no longer exists" if row.nil?
 
       wallet_id, amount, expires_at, remaining = row
-      raise InvalidHold, "Transaction #{credit.id} belongs to another wallet" unless wallet_id == id
-      raise InvalidHold, "Transaction #{credit.id} is a debit: only credits can be held" unless amount.positive?
+      raise ArgumentError, "Transaction #{credit.id} belongs to another wallet" unless wallet_id == id
+      raise ArgumentError, "Transaction #{credit.id} is a debit: only credits can be held" unless amount.positive?
       raise InvalidHold, "Credit #{credit.id} has expired" if expires_at.present? && expires_at <= evaluation_time
       raise InvalidHold, "Credit #{credit.id} has no remaining value to hold" unless remaining.to_i.positive?
     end

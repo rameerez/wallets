@@ -414,19 +414,47 @@ class CurrentReadsTest < ActiveSupport::TestCase
     assert_empty @wallet.transactions.debits
   end
 
-  test "a capture after a stale read finds the reservation already captured and creates nothing" do
+  test "a capture after a stale read finds the reservation already captured, creates nothing, and leaves the caller's copy reading the capture" do
     reservation = @wallet.reserve(80, category: :booking)
+    winner = nil
 
-    outcome = after_a_stale_read(-> { Wallets::Hold.find(reservation.id).capture!(category: :purchase) }) do
-      Wallets::Hold.find(reservation.id).capture!(category: :purchase) # active, as this snapshot saw it
-    rescue Wallets::InvalidHold => error
-      error
+    copy, outcome = after_a_stale_read(-> { winner = Wallets::Hold.find(reservation.id).capture!(category: :purchase) }) do
+      stale = Wallets::Hold.find(reservation.id) # active, as this snapshot saw it
+      begin
+        stale.capture!(category: :purchase)
+      rescue Wallets::InvalidHold => error
+        [stale, error]
+      end
     end
 
     assert_kind_of Wallets::InvalidHold, outcome
-    assert_match(/was already captured/, outcome.message)
-    assert_equal 1, @wallet.transactions.debits.count
+    assert_equal "Reservation #{reservation.id} was already captured (transaction #{winner.id})", outcome.message
+    assert copy.captured?, "the copy is read back as the ledger has it, never from the old snapshot"
+    assert_equal winner.id, copy.capture_transaction_id
+    assert_equal "captured", copy.release_reason
+    refute copy.active?
+    assert_equal [winner.id], @wallet.transactions.debits.pluck(:id)
     assert_equal 20, @wallet.reload.balance
+  end
+
+  test "a release that fails after a stale read leaves the caller's copy reading the release that happened" do
+    hold = @wallet.hold(@credit, category: :fraud_review)
+
+    copy, outcome = after_a_stale_read(-> { Wallets::Hold.find(hold.id).release!(reason: "first") }) do
+      stale = Wallets::Hold.find(hold.id) # active, as this snapshot saw it
+      stale.stubs(:lock!).raises(ActiveRecord::LockWaitTimeout, "lock wait timeout")
+      begin
+        stale.release!(reason: "second")
+      rescue ActiveRecord::LockWaitTimeout => error
+        [stale, error]
+      end
+    end
+
+    assert_kind_of ActiveRecord::LockWaitTimeout, outcome
+    assert copy.released?, "the copy is read back as the ledger has it, never from the old snapshot"
+    refute copy.active?
+    assert_equal "first", copy.release_reason
+    assert_equal "first", hold.reload.release_reason
   end
 
   test "a capture and a release racing for one reservation settle on one terminal transition" do

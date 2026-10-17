@@ -218,7 +218,9 @@ class Wallets::WalletHoldCommandsTest < ActiveSupport::TestCase
   # hold: what can be held
   # ───────────────────────────────────────────────────────────────────────────
 
-  test "only a credit of this very wallet can be held" do
+  test "anything but a credit of this very wallet is a wrong argument" do
+    # The same line `from:` draws: ArgumentError for what is not a credit of
+    # this wallet, InvalidHold for a credit the ledger's state rules out.
     wallet = points_wallet
     credit = wallet.credit(100, category: :reward)
     debit = wallet.debit(10, category: :purchase)
@@ -233,7 +235,7 @@ class Wallets::WalletHoldCommandsTest < ActiveSupport::TestCase
       hold!(wallet) => /A hold covers a Wallets::Transaction, not Wallets::Hold/
     }.each do |target, message|
       assert_no_holds_written(wallet) do
-        error = assert_raises(Wallets::InvalidHold) { wallet.hold(target, category: :review) }
+        error = assert_raises(ArgumentError) { wallet.hold(target, category: :review) }
         assert_match message, error.message
       end
     end
@@ -274,12 +276,12 @@ class Wallets::WalletHoldCommandsTest < ActiveSupport::TestCase
     assert_nil other.reload.expires_at, "the caller's unsaved change is never written"
   end
 
-  test "a credit removed from the ledger cannot be held" do
+  test "a credit removed from the ledger is a wrong argument" do
     wallet = points_wallet
     credit = wallet.credit(100, category: :reward)
     Wallets::Transaction.where(id: credit.id).delete_all
 
-    error = assert_raises(Wallets::InvalidHold) { wallet.hold(credit, category: :review) }
+    error = assert_raises(ArgumentError) { wallet.hold(credit, category: :review) }
     assert_equal "Transaction #{credit.id} no longer exists", error.message
   end
 
