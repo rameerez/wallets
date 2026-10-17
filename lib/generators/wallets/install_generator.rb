@@ -30,7 +30,7 @@ module Wallets
         say "  2. Add 'has_wallets' to any model that should own wallets."
         say "  3. Adjust config/initializers/wallets.rb for your default asset, categories, and callbacks."
         say "  4. Use owner.wallet(:asset_code) to start crediting, debiting, and transferring value."
-        say "\nYou now have an append-only wallet ledger with balances, allocations, and transfers.\n", :green
+        say "\nYou now have an append-oriented wallet ledger with balances, allocations, and transfers.\n", :green
       end
 
       private

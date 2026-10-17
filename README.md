@@ -5,7 +5,7 @@
 > [!TIP]
 > **🚀 Ship your next Rails app 10x faster!** I've built **[RailsFast](https://railsfast.com/?ref=wallets)**, a production-ready Rails boilerplate template that comes with everything you need to launch a software business in days, not weeks. Go [check it out](https://railsfast.com/?ref=wallets)!
 
-Allow your users to have wallets with money-like balances for value holding and transfering. `wallets` gives any Rails model money-like wallets backed by an append-only transaction ledger. You can use these wallets to store and transfer value in any "currency" (points inside your app, call minutes, in-game resources, in-app assets, etc.)
+Allow your users to have wallets with money-like balances for value holding and transferring. `wallets` gives any Rails model money-like wallets backed by an append-oriented transaction ledger. You can use these wallets to store and transfer value in any "currency" (points inside your app, call minutes, in-game resources, in-app assets, etc.)
 
 ![wallets](wallets.webp)
 
@@ -50,8 +50,8 @@ user.wallet(:mb).balance  # => 6656 MB remaining
 | Feature | What it does |
 |---------|--------------|
 | **Multi-asset** | One wallet per asset: `user.wallet(:usd)`, `user.wallet(:gems)` |
-| **Append-only ledger** | Every balance change is a transaction: no edits, only new entries |
-| **FIFO allocation** | Debits consume oldest credits first (important for expiring balances) |
+| **Append-oriented ledger API** | Every balance change made through the wallet API creates a transaction row |
+| **Expiration-aware allocation** | Debits consume soonest-expiring credits first, then the oldest bucket |
 | **Linked transfers** | Both sides of a transfer are recorded and queryable |
 | **Row-level locking** | Prevents race conditions and double-spending |
 | **Balance snapshots** | Each transaction records before/after balance for reconciliation |
@@ -64,6 +64,8 @@ Add the gem to your Gemfile:
 ```ruby
 gem "wallets"
 ```
+
+Requires Ruby 3.2+ and Rails 7.2.3.1–8.x. Ruby 3.2 is the security floor because current patched versions of transitive Rails dependencies no longer support Ruby 3.1.
 
 Then run:
 
@@ -270,7 +272,7 @@ A few things to know:
 - **`:balance_depleted` fires on positive→non-positive crossings**, not on exact zero. A debit that takes a wallet from +100 to -50 in one shot still fires the callback. With `allow_negative_balance = false` the behavior collapses back to "exactly zero" (since balances can't go below zero), so existing callers don't see a change.
 - **`:low_balance_reached` is one-shot per crossing**, regardless of how deep the dip goes. Going from +200 to -100 fires once; the next debit from -100 to -200 does not re-fire because the wallet was already below threshold.
 - **`:insufficient_balance` callback.** Fires only when a debit or transfer is actually rejected (i.e. flag off or your service-layer floor refused). Successful overdraft transfers do not fire it.
-- **Credits don't auto-settle prior debt.** If a wallet is at -50 and you `credit(80)`, the wallet's balance becomes 30 — but the unbacked -50 debit and the +80 credit persist as independent ledger rows. The next debit consumes from the +80 bucket (FIFO) without back-filling the older unbacked debit. The math is consistent; the audit story is "we never settled the original debt with this credit". If you want auto-settlement, do it in your service layer (e.g. when crediting, `wallet.transactions.where("amount < 0").where("ABS(amount) > spent_amount") …` and create allocations explicitly).
+- **Credits don't auto-settle prior debt.** If a wallet is at -50 and you `credit(80)`, the wallet's balance becomes 30 — but the unbacked -50 debit and the +80 credit persist as independent ledger rows. The next debit consumes from the +80 bucket without back-filling the older unbacked debit. The math is consistent; the audit story is "we never settled the original debt with this credit". If you want auto-settlement, do it in your service layer (e.g. when crediting, `wallet.transactions.where("amount < 0").where("ABS(amount) > spent_amount") …` and create allocations explicitly).
 - **System-initiated reversals.** Refunds and payout reversals via `transfer_to` will also go through, even if the recipient's wallet ends up below zero. That's correct: the ledger has to settle, and a negative wallet records a real debt instead of a silent failure. Apps that want to *block* user-initiated overdrafts but *allow* system reversals should keep the floor check in their service layer, not toggle the flag mid-request.
 - **Don't toggle the flag at runtime while wallets are negative.** `allow_negative_balance` is meant to be a stable config decision. The model carries a `balance >= 0` validation gated on the flag; flipping it OFF while wallets sit below zero leaves them un-saveable until you flip it back on (any subsequent `credit` / `debit` calls `refresh_cached_balance!`, which raises a `RecordInvalid`). If you need to turn the flag off, drain or settle any negative wallets first.
 - **Concurrency holds.** `wallet.debit` / `wallet.credit` use `with_lock` (row-level `SELECT … FOR UPDATE`); `wallet.transfer_to` locks both wallets in id order via `lock_wallet_pair!`. Two concurrent overdraft debits on the same wallet serialize cleanly — they don't double-count `previous_balance`.
@@ -316,6 +318,8 @@ end
 
 `wallets` ships with lifecycle callbacks you can use for notifications, analytics, or product logic.
 
+Successful callbacks run after the outermost database transaction commits. If a caller wraps a wallet operation in a larger transaction and later rolls it back, no success callback is emitted. Callback exceptions are logged and isolated from the already-committed ledger write. `on_insufficient_balance` remains immediate because it describes a rejected operation rather than a committed row.
+
 ```ruby
 Wallets.configure do |config|
   config.on_balance_credited do |ctx|
@@ -359,14 +363,14 @@ Both gems handle balances, but they solve different problems:
 ┌─────────────────────────────────────────────────────────────────┐
 │                      usage_credits                              │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │  Subscriptions, Credit Packs, Pay Intgration, Fulfillment │  │
+│  │  Subscriptions, Credit Packs, Pay Integration, Fulfillment│  │
 │  │  Operations DSL, Pricing, Refunds, Webhook Handling       │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                            │                                    │
 │                            ▼                                    │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │                       wallets                             │  │
-│  │    Balance, Credit, Debit, Transfer, Expiration, FIFO,    │  │
+│  │    Balance, Credit, Debit, Transfer, Expiration, FEFO,    │  │
 │  │    Audit Trail, Row-Level Locking, Multi-Asset            │  │
 │  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
@@ -770,17 +774,19 @@ See [usage_credits](https://github.com/rameerez/usage_credits) — it uses `wall
 
 ## Is this production-ready?
 
-Yes, this is production-ready for internal app balances and user-to-user value transfer inside your product. It is substantially more trustworthy than a single integer column because it gives you an append-only ledger, FIFO allocation, linked transfer records, balance snapshots, and row-level locking.
+Yes, this is production-ready for internal app balances and user-to-user value transfer inside your product. It is substantially more trustworthy than a single integer column because it gives you an append-oriented transaction ledger, expiration-aware allocation, linked transfer records, balance snapshots, and row-level locking.
 
 In practice, that means you get:
 
 - a full transaction history instead of just a cached balance
-- FIFO consumption of the oldest available balance buckets
+- FEFO consumption of the soonest-expiring balance buckets, with oldest-first ties
 - linked debit/credit records for transfers between users
 - concurrency protection when multiple writes hit the same wallet
 - enough structure to support marketplace balances, peer payments, rewards, and in-game assets inside a real production app
 
 If your product needs users to hold value, earn value, spend value, or transmit value to other users inside your own app, this is the sort of foundation you want instead of `users.balance += 1`.
+
+The wallet API is append-oriented, but the gem does not turn Active Record or your database into a tamper-proof store: application code with model/SQL access can still update rows, and destroying an owner intentionally cascades through that owner's wallet history. Use soft deletion or an application-level destroy restriction when records must be retained; also restrict write access, retain backups, reconcile against external processors, and use database/audit controls appropriate to your risk model. If you need legally immutable records, regulated custody, or accounting-grade journals, use purpose-built infrastructure.
 
 ## Can it support payments between users?
 
@@ -799,8 +805,52 @@ What it does not do for you:
 
 So the right framing is: strong internal wallet/accounting primitive, not money infrastructure by itself.
 
+## Embedding `wallets` in your own gem
+
+`wallets` is built to be embeddable: other gems can reuse the ledger core (expiration-aware allocation, locking, transfers, callbacks) on top of their **own** tables, config, and event names. This is exactly how [`usage_credits`](https://github.com/rameerez/usage_credits) works — its `UsageCredits::Wallet` is a `Wallets::WalletBase` subclass living in `usage_credits_*` tables.
+
+> [!IMPORTANT]
+> **Subclass the abstract `*Base` classes** (`Wallets::WalletBase`, `Wallets::TransactionBase`, `Wallets::AllocationBase`, `Wallets::TransferBase`) — **not** the concrete `Wallets::Wallet` etc. ActiveRecord builds a subclass's attribute methods on its parent's, so subclassing a concrete model forces a schema load of the `wallets_*` tables — which don't exist in apps that only install your gem. The abstract parents make each embedded model its own `base_class`, so the base tables are never consulted.
+
+These class-level hooks are a supported, stable contract (covered by tests — breaking them is a breaking change for downstream gems):
+
+```ruby
+class MyGem::Wallet < Wallets::WalletBase
+  self.embedded_table_name = "my_gem_wallets"            # your table, not wallets_wallets
+  self.config_provider = -> { MyGem.configuration }      # your config object
+  self.callbacks_module = MyGem::Callbacks               # your callback dispatcher
+  self.transaction_class_name = "MyGem::Transaction"     # your subclasses
+  self.allocation_class_name = "MyGem::Allocation"
+  self.transfer_class_name = "MyGem::Transfer"
+
+  # Rename (or silence, with nil) core events for your domain:
+  self.callback_event_map = {
+    credited: :coins_added,
+    debited: :coins_spent,
+    insufficient: :not_enough_coins,
+    low_balance: :low_balance,
+    depleted: :out_of_coins,
+    transfer_completed: nil  # nil = don't dispatch this event
+  }.freeze
+
+  class << self
+    private
+
+    # Customize the ledger entry recorded for `create_for_owner!(initial_balance:)`
+    def initial_balance_credit_attributes
+      { category: :starting_coins, metadata: { reason: "initial_balance" } }
+    end
+  end
+end
+```
+
+Your `Transaction`, `Allocation`, and `Transfer` subclasses (of `Wallets::TransactionBase`, `Wallets::AllocationBase`, `Wallets::TransferBase`) set `embedded_table_name` (and `config_provider` / `transaction_class_name` where relevant) the same way.
+
+One current limitation to be aware of: the core models declare their associations against the `Wallets::*` class names, so your subclasses should **re-declare associations** with your own classes (`belongs_to :wallet, class_name: "MyGem::Wallet"`, etc.) so that records load as your subclasses rather than the core ones. See `usage_credits`' models for the canonical embedding pattern.
+
 ## TODO
 
+- Dynamic association class resolution for embedded subclasses (so embedders don't need to re-declare associations)
 - First-class transfer reversal/refund API built on compensating ledger entries
 - Optional pending/held balance primitives for escrow-like flows
 - Multi-step transfer policies beyond `:preserve`, `:none`, and fixed `expires_at`

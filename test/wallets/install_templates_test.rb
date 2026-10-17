@@ -11,6 +11,8 @@ class Wallets::InstallTemplatesTest < ActiveSupport::TestCase
     assert_includes template, "add_index wallets_table"
     assert_equal 4, template.scan("t.bigint").size
     assert_includes template, 't.string :expiration_policy, null: false, default: "preserve"'
+    assert_includes template, '"amount <> 0"'
+    assert_includes template, '"from_wallet_id <> to_wallet_id"'
     refute_includes template, "outbound_transaction"
     refute_includes template, "inbound_transaction"
   end

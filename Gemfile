@@ -8,8 +8,9 @@ gem "rake", "~> 13.0"
 
 group :development do
   gem "appraisal"
+  gem "bundler-audit", "~> 0.9"
   gem "web-console"
-  gem "standard"
+  gem "standard", ">= 1.35.1"
   gem "rubocop", "~> 1.0"
   gem "rubocop-minitest", "~> 0.35"
   gem "rubocop-performance", "~> 1.0"
@@ -20,7 +21,7 @@ group :test do
   gem "mocha"
   gem "simplecov", require: false
 
-  gem "sqlite3"
+  gem "sqlite3", ">= 2.9.5"
   gem "pg"
   gem "mysql2"
 

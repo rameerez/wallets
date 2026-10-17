@@ -12,6 +12,9 @@ on:
       - "*.md"
       - "LICENSE.txt"
 
+permissions:
+  contents: read
+
 jobs:
   # Main test suite - tests Ruby versions and Rails compatibility with SQLite
   sqlite:
@@ -22,17 +25,32 @@ jobs:
       matrix:
         ruby_version: ["3.3", "3.4", "4.0"]
         gemfile:
-          - Gemfile
-          - gemfiles/rails_7.2.gemfile
-          - gemfiles/rails_8.1.gemfile
+          - path: Gemfile
+            label: default
+          - path: gemfiles/rails_7.2.gemfile
+            label: rails-7.2
+          - path: gemfiles/rails_8.1.gemfile
+            label: rails-8.1
+        include:
+          # Exercise both Rails boundaries on the minimum secure Ruby line.
+          - ruby_version: "3.2"
+            gemfile:
+              path: gemfiles/rails_7.2.gemfile
+              label: rails-7.2
+          - ruby_version: "3.2"
+            gemfile:
+              path: gemfiles/rails_8.1.gemfile
+              label: rails-8.1
 
     env:
       RAILS_ENV: test
-      BUNDLE_GEMFILE: ${{ github.workspace }}/${{ matrix.gemfile }}
+      BUNDLE_GEMFILE: ${{ github.workspace }}/${{ matrix.gemfile.path }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Ruby ${{ matrix.ruby_version }}
         uses: ruby/setup-ruby@v1
@@ -47,11 +65,50 @@ jobs:
 
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: test-results-sqlite-ruby-${{ matrix.ruby_version }}-${{ matrix.gemfile }}
+          name: test-results-sqlite-ruby-${{ matrix.ruby_version }}-${{ matrix.gemfile.label }}
           path: test/reports/
           retention-days: 7
+
+  security:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        gemfile:
+          - path: Gemfile
+            label: default
+          - path: gemfiles/rails_7.2.gemfile
+            label: rails-7.2
+          - path: gemfiles/rails_8.1.gemfile
+            label: rails-8.1
+
+    env:
+      BUNDLE_GEMFILE: ${{ github.workspace }}/${{ matrix.gemfile.path }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      - name: Audit locked dependencies
+        # ruby/setup-ruby may remove an untracked lock after populating its
+        # cache, and bundler-audit does not infer the appraisal lock path from
+        # BUNDLE_GEMFILE. Its --gemfile-lock value is relative to the scan root,
+        # so strip the absolute workspace prefix before auditing.
+        run: |
+          bundle lock
+          lockfile="${BUNDLE_GEMFILE#"$GITHUB_WORKSPACE/"}.lock"
+          bundle exec bundle-audit check --update --gemfile-lock "$lockfile"
 
   # PostgreSQL compatibility tests
   postgres:
@@ -83,7 +140,9 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Ruby ${{ matrix.ruby_version }}
         uses: ruby/setup-ruby@v1
@@ -102,7 +161,7 @@ jobs:
 
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results-postgres-ruby-${{ matrix.ruby_version }}
           path: test/reports/
@@ -137,7 +196,9 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Ruby ${{ matrix.ruby_version }}
         uses: ruby/setup-ruby@v1
@@ -156,7 +217,7 @@ jobs:
 
       - name: Upload test results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results-mysql-ruby-${{ matrix.ruby_version }}
           path: test/reports/
