@@ -103,6 +103,64 @@ class Wallets::StaleSnapshotTest < ActiveSupport::TestCase
     )
   end
 
+  test "a verdict ends with its transaction even when a failing commit hook skips its cleanup" do
+    # Active Record stops running commit hooks at the first one that raises.
+    # A host app's hook registered before ours would leave the verdict behind,
+    # and every later transaction on this connection would lock for nothing.
+    Wallets::Wallet.stubs(:current_reads_need_locks?).returns(true)
+
+    error = assert_raises(RuntimeError) do
+      Wallets::Wallet.transaction do
+        ActiveRecord::Base.current_transaction.after_commit { raise "boom" }
+        @wallet.touch # the caller's own write: stale for the rest of the transaction
+        @wallet.lock!
+        assert @wallet.send(:stale_snapshot?)
+      end
+    end
+    assert_equal "boom", error.message
+    assert_equal 1, remembered_stale_snapshots.size, "the cleanup hook never ran"
+
+    Wallets::Wallet.transaction do
+      @wallet.lock!
+      refute @wallet.send(:stale_snapshot?), "the next transaction starts from a clean slate"
+    end
+    assert_empty remembered_stale_snapshots, "nothing stays remembered"
+  end
+
+  test "a verdict whose real transaction cannot be found lasts until its hook ends it, never less" do
+    # Should a later Rails change the transaction stack, the verdict falls
+    # back to how long it always lasted: through every savepoint, to the end
+    # of the real transaction.
+    Wallets::Wallet.stubs(:current_reads_need_locks?).returns(true)
+    connection.transaction_manager.stubs(:instance_variable_defined?).with(:@stack).returns(false)
+    verdicts = {}
+
+    Wallets::Wallet.transaction(joinable: false) do
+      Wallets::Wallet.transaction(requires_new: true) { @wallet.touch }
+      @wallet.lock!
+      verdicts[:after_its_savepoint] = @wallet.send(:stale_snapshot?)
+    end
+    verdicts[:after_the_commit] = remembered_stale_snapshots.any?
+
+    assert_equal({after_its_savepoint: true, after_the_commit: false}, verdicts)
+  end
+
+  test "the real transaction is the outermost one, whatever savepoints are open" do
+    outermost = nil
+
+    connection.transaction do
+      outermost = connection.current_transaction
+      connection.transaction(requires_new: true) do
+        connection.transaction(requires_new: true) do
+          assert_same outermost, @wallet.send(:real_transaction, connection)
+        end
+      end
+    end
+
+    assert outermost.state.finalized?
+    assert_nil @wallet.send(:real_transaction, connection), "none once it has ended"
+  end
+
   # ───────────────────────────────────────────────────────────────────────────
   # What makes a verdict
   # ───────────────────────────────────────────────────────────────────────────

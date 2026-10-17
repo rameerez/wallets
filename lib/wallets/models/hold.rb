@@ -129,6 +129,28 @@ module Wallets
       wallet.send(:release_hold!, self, reason: reason, metadata: metadata)
     end
 
+    # Charges this reservation: posts a debit for the reserved amount, or
+    # less, and ends the reservation in the same step, the way a merchant
+    # captures a pending card charge. A smaller capture releases the rest.
+    # Returns the debit, which `capture_transaction` reaches from then on.
+    #
+    #   debit = reservation.capture!(2_750, category: :booking_charge, metadata: {booking_id: 9})
+    #   reservation.capture_transaction # => debit
+    #
+    # Only an active reservation can be captured, once: a released, lapsed
+    # or already captured one raises Wallets::InvalidHold and creates
+    # nothing, so a retried request never charges twice. Capture is still
+    # funded at the moment it happens: value a hold covers is not spent, and
+    # unless overdrafts are on a capture the wallet cannot fund raises
+    # Wallets::InsufficientBalance and leaves the reservation as it was.
+    def capture!(amount = nil, category:, metadata: {})
+      raise InvalidHold, "Only a saved reservation can be captured" unless persisted?
+
+      # The wallet runs the capture: it takes its own lock before reading
+      # this reservation, the same order as every other command.
+      wallet.send(:capture_reservation!, self, amount, category: category, metadata: metadata)
+    end
+
     private
 
     def normalize_category!

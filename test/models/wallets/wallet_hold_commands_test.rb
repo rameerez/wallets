@@ -825,6 +825,30 @@ class Wallets::WalletHoldCommandsTest < ActiveSupport::TestCase
     assert Wallets::Hold.find(hold.id).active?
   end
 
+  test "a release that fails after its write leaves the caller's hold reading active" do
+    # Active Record would leave the copy holding the rolled-back release,
+    # with no unsaved changes to give it away.
+    wallet = points_wallet(100)
+    hold = wallet.hold(category: :chargeback, metadata: {case_id: 1})
+    hold.wallet.stubs(:refresh_cached_balance!).raises(ActiveRecord::StatementInvalid, "boom")
+
+    Wallets::Wallet.transaction do
+      assert_raises(ActiveRecord::StatementInvalid) { hold.release!(reason: "cleared", metadata: {actor_id: 7}) }
+    end
+
+    assert hold.active?
+    refute hold.released?
+    assert_nil hold.released_at
+    assert_nil hold.release_reason
+    assert_equal({}, hold.release_metadata)
+    assert_equal({"case_id" => 1}, hold.metadata)
+    refute hold.has_changes_to_save?
+
+    hold.wallet.unstub(:refresh_cached_balance!)
+    hold.release!(reason: "cleared")
+    assert_equal "cleared", hold.reload.release_reason, "and it can be released again"
+  end
+
   test "the pinned instant is released after every hold command, even a failing one" do
     wallet = points_wallet(10)
 

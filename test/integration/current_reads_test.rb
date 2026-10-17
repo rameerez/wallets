@@ -354,6 +354,138 @@ class CurrentReadsTest < ActiveSupport::TestCase
     assert_equal 100, @wallet.balance
   end
 
+  # ───────────────────────────────────────────────────────────────────────────
+  # Targeted debits against concurrent writers
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "a targeted debit sees a reservation committed after its caller's first read" do
+    outcome = after_a_stale_read(-> { Wallets::Wallet.find(@wallet.id).reserve(80, category: :booking) }) do |wallet|
+      wallet.debit(60, category: :purchase, from: Wallets::Transaction.find(@credit.id))
+    rescue Wallets::InsufficientBalance => error
+      error
+    end
+
+    assert_kind_of Wallets::InsufficientBalance, outcome
+    assert_equal "Insufficient balance (20 < 60; 80 reserved)", outcome.message
+    assert_empty @wallet.transactions.debits
+  end
+
+  test "a targeted debit never takes what a debit committed after its caller's first read already spent" do
+    outcome = after_a_stale_read(-> { Wallets::Wallet.find(@wallet.id).debit(60, category: :purchase) }) do |wallet|
+      wallet.debit(60, category: :purchase, from: Wallets::Transaction.find(@credit.id))
+    rescue Wallets::InsufficientBalance => error
+      error
+    end
+
+    assert_kind_of Wallets::InsufficientBalance, outcome
+    assert_equal "Insufficient balance (40 < 60 in the named credits)", outcome.message
+    assert_equal 60, @credit.incoming_allocations.sum(:amount), "the credit is never over-allocated"
+  end
+
+  test "a targeted debit sees a hold committed after its caller's first read, and cancels the held value" do
+    # With the hold seen, the 30 it takes is held value and needs no funding
+    # even though a reservation leaves nothing available.
+    @wallet.reserve(100, category: :booking)
+
+    spend = after_a_stale_read(-> { Wallets::Wallet.find(@wallet.id).hold(@credit, category: :fraud_review) }) do |wallet|
+      wallet.debit(30, category: :purchase, from: Wallets::Transaction.find(@credit.id))
+    end
+
+    assert_equal [[@credit.id, 30]], spend.outgoing_allocations.pluck(:source_transaction_id, :amount)
+    assert_equal [-100, 170, 70], [@wallet.balance, @wallet.held_balance, @wallet.total_balance]
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Capture against concurrent writers
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "a capture sees a hold committed after its caller's first read" do
+    reservation = @wallet.reserve(80, category: :booking)
+
+    outcome = after_a_stale_read(-> { Wallets::Wallet.find(@wallet.id).hold(category: :chargeback) }) do
+      Wallets::Hold.find(reservation.id).capture!(category: :purchase)
+    rescue Wallets::InsufficientBalance => error
+      error
+    end
+
+    assert_kind_of Wallets::InsufficientBalance, outcome
+    assert_equal "Insufficient balance (0 < 80 to capture reservation #{reservation.id}; 100 held, 80 reserved)", outcome.message
+    assert reservation.reload.active?
+    assert_empty @wallet.transactions.debits
+  end
+
+  test "a capture after a stale read finds the reservation already captured and creates nothing" do
+    reservation = @wallet.reserve(80, category: :booking)
+
+    outcome = after_a_stale_read(-> { Wallets::Hold.find(reservation.id).capture!(category: :purchase) }) do
+      Wallets::Hold.find(reservation.id).capture!(category: :purchase) # active, as this snapshot saw it
+    rescue Wallets::InvalidHold => error
+      error
+    end
+
+    assert_kind_of Wallets::InvalidHold, outcome
+    assert_match(/was already captured/, outcome.message)
+    assert_equal 1, @wallet.transactions.debits.count
+    assert_equal 20, @wallet.reload.balance
+  end
+
+  test "a capture and a release racing for one reservation settle on one terminal transition" do
+    debited = Queue.new
+    released = Queue.new
+    Wallets.configuration.on_balance_debited { |context| debited << context.transaction.id }
+    Wallets.configuration.on_hold_released { |context| released << [context.hold.release_reason, context.transaction&.id] }
+
+    8.times do
+      wallet = new_wallet(initial_balance: 100)
+      reservation = wallet.reserve(60, category: :booking)
+
+      capture, release = all_at_once(%i[capture release]) do |command|
+        racer = Wallets::Hold.find(reservation.id)
+        (command == :capture) ? racer.capture!(category: :purchase) : racer.release!(reason: "cancelled")
+      end
+
+      reservation.reload
+      if capture.is_a?(Wallets::Transaction)
+        assert_equal [capture.id], drain(debited), "a successful capture reports one debit"
+        assert_equal [["captured", capture.id]], drain(released), "and one release, naming it; the late release reports nothing"
+        assert_equal "captured", release.release_reason, "the late release finds the capture"
+        assert_equal capture.id, reservation.capture_transaction_id
+        assert_equal [capture.id], wallet.transactions.debits.pluck(:id)
+        assert_equal 40, wallet.balance
+      else
+        assert_kind_of Wallets::InvalidHold, capture, "a capture after the release creates nothing"
+        assert_empty drain(debited)
+        assert_equal [["cancelled", nil]], drain(released)
+        assert_equal "cancelled", reservation.release_reason
+        refute reservation.captured?
+        assert_empty wallet.transactions.debits
+        assert_equal 100, wallet.balance
+      end
+      assert_equal wallet.balance, wallet.reload.read_attribute(:balance), "the cached balance matches the ledger"
+    end
+  end
+
+  test "concurrent captures of one reservation post one debit and report it once" do
+    reservation = @wallet.reserve(60, category: :booking)
+    debited = Queue.new
+    released = Queue.new
+    Wallets.configuration.on_balance_debited { |context| debited << context.transaction.id }
+    Wallets.configuration.on_hold_released { |context| released << context.transaction.id }
+
+    outcomes = all_at_once(Array.new(concurrency) { |i| i }) do
+      Wallets::Hold.find(reservation.id).capture!(category: :purchase)
+    end
+
+    captures = outcomes.grep(Wallets::Transaction)
+    assert_equal 1, captures.size, "unexpected outcomes: #{outcomes.map(&:inspect)}"
+    assert outcomes.grep_v(Wallets::Transaction).all?(Wallets::InvalidHold), "every other attempt is refused: #{outcomes.map(&:inspect)}"
+    assert_equal [captures.sole.id], drain(debited)
+    assert_equal [captures.sole.id], drain(released)
+    assert_equal [captures.sole.id], @wallet.transactions.debits.pluck(:id)
+    assert_equal captures.sole.id, reservation.reload.capture_transaction_id
+    assert_equal 40, @wallet.reload.balance
+  end
+
   private
 
   def drain(queue)

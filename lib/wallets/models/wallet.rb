@@ -54,6 +54,13 @@ module Wallets
     WHOLE_WALLET = Object.new.freeze
     private_constant :WHOLE_WALLET
 
+    # What `debit` and `transfer_to` spend when `from:` is left out: any
+    # eligible credit, soonest-expiring first. A sentinel for the same reason
+    # as WHOLE_WALLET: a nil from a lookup that found nothing must be an
+    # error, never a debit that quietly spends some other credit.
+    ELIGIBLE_CREDITS = Object.new.freeze
+    private_constant :ELIGIBLE_CREDITS
+
     # The keywords `credit(..., hold: {...})` accepts: the ones `hold` takes.
     ARRIVAL_HOLD_OPTIONS = %i[category until metadata].freeze
     private_constant :ARRIVAL_HOLD_OPTIONS
@@ -372,9 +379,28 @@ module Wallets
       end
     end
 
-    def debit(amount, metadata: {}, category: :debit, transfer: nil, **extra_transaction_attributes)
+    # Takes value out of the wallet. Ordinarily it spends eligible credits,
+    # soonest-expiring first, and never touches held value.
+    #
+    # `from:` names the credits to take it from instead, in the order given.
+    # It is the one way to take value a hold covers, so it is how a hold ends
+    # the other way: releasing gives the value back, `from:` takes it away.
+    # The debit is allocated to the named credits in full or not at all,
+    # never to other credits and never to debt, and the holds stay exactly as
+    # they were: a cancelled credit keeps its reasons with nothing left to
+    # hold.
+    #
+    #   wallet.debit(751, category: :reversal, from: credit, metadata: {reason: "reward_rejected"})
+    #   wallet.debit(150, category: :reversal, from: [first_credit, second_credit])
+    #
+    # Held value needs no funding, but the rest of a targeted debit does:
+    # with overdrafts off, what it takes from unheld credits must fit in the
+    # available balance, so naming an unheld credit cannot spend value that a
+    # reservation set aside, nor deepen a deficit.
+    def debit(amount, metadata: {}, category: :debit, transfer: nil, from: ELIGIBLE_CREDITS, **extra_transaction_attributes)
       metadata = normalize_metadata(metadata)
       extra_transaction_attributes = validate_additional_transaction_attributes!(extra_transaction_attributes)
+      sources = named_credits(from)
 
       with_lock(requires_new: true) do
         apply_debit(
@@ -382,7 +408,8 @@ module Wallets
           metadata: metadata,
           category: category,
           transfer: transfer,
-          extra_attributes: extra_transaction_attributes
+          extra_attributes: extra_transaction_attributes,
+          from: sources
         )
       end
     end
@@ -451,7 +478,12 @@ module Wallets
     # Transfers
     # =========================================
 
-    def transfer_to(other_wallet, amount, category: :transfer, metadata: {}, expiration_policy: nil, expires_at: nil)
+    # Moves value to another wallet of the same asset. `from:` works as it
+    # does on `debit`: the outbound leg is taken from the named credits only,
+    # held value included, and the inbound legs are credited as usual.
+    #
+    #   wallet.transfer_to(platform.wallet, 751, category: :reversal, from: credit)
+    def transfer_to(other_wallet, amount, category: :transfer, metadata: {}, expiration_policy: nil, expires_at: nil, from: ELIGIBLE_CREDITS)
       raise InvalidTransfer, "Target wallet is required" if other_wallet.nil?
       raise InvalidTransfer, "Source wallet must be persisted" unless persisted?
       raise InvalidTransfer, "Target wallet must be persisted" unless other_wallet.persisted?
@@ -464,6 +496,7 @@ module Wallets
       amount = normalize_positive_amount!(amount)
       metadata = normalize_metadata(metadata)
       resolved_policy, inbound_expires_at = resolve_transfer_expiration!(expiration_policy, expires_at)
+      sources = named_credits(from)
 
       # A savepoint even inside a caller's transaction, like every command: a
       # transfer whose inbound leg fails must take its outbound debit and its
@@ -495,7 +528,13 @@ module Wallets
           # remaining shortfall lands as an unbacked negative transaction the
           # wallet's `balance` accounting accommodates via
           # `unbacked_negative_balance`.
-          if amount > previous_balance && !allow_negative_balance?
+          #
+          # A targeted transfer is funded like a targeted debit instead (see
+          # `named_buckets!`), and checked here for the same reason: a refusal
+          # must leave no Transfer row behind.
+          if sources
+            named_buckets!(sources, amount, previous_balance, metadata)
+          elsif amount > previous_balance && !allow_negative_balance?
             reject_insufficient_balance!(amount, previous_balance, metadata)
           end
 
@@ -517,11 +556,16 @@ module Wallets
           # sums exactly the buckets `allocate_debit!` walks, at this instant
           # and under these locks, so it is the outcome, not an estimate.
           #
+          # A targeted transfer never has an unbacked portion (the named
+          # credits fund all of it or the transfer is refused above), so it
+          # always keeps its sources' expirations, even when they are held
+          # and nothing is available.
+          #
           # Callers who care about a specific expiration on the inbound side
           # should pass `expiration_policy: :fixed, expires_at: …`. Those are
           # honored unchanged because they don't depend on source-bucket
           # walking. Same for an explicit `:none`.
-          if resolved_policy == "preserve" && amount > eligible_remaining_balance
+          if resolved_policy == "preserve" && sources.nil? && amount > eligible_remaining_balance
             resolved_policy = "none"
             inbound_expires_at = nil
           end
@@ -551,7 +595,8 @@ module Wallets
               "counterparty_owner_id" => other_wallet.owner_id,
               "counterparty_owner_type" => other_wallet.owner_type
             ),
-            transfer: transfer
+            transfer: transfer,
+            from: sources
           )
 
           build_transfer_inbound_credit_specs(
@@ -710,7 +755,7 @@ module Wallets
     # wallet row, its snapshot shows its own write and could no longer tell.
     def stale_snapshot?
       return false unless self.class.current_reads_need_locks?
-      return true if remembered_stale_snapshots.include?(stale_snapshot_key)
+      return true if remembered_stale_snapshots.key?(stale_snapshot_key)
 
       snapshot = self.class.uncached { self.class.unscoped.where(id: id).pick(:updated_at, :balance) }
       return false if snapshot == [updated_at, read_attribute(:balance)]
@@ -719,19 +764,47 @@ module Wallets
       true
     end
 
+    # Remembers the verdict with the real transaction it belongs to. The
+    # hook at that transaction's end is only the cleanup: Active Record skips
+    # the remaining commit hooks when an earlier one raises (a host model's
+    # `after_commit`, say), and a verdict outliving its transaction would make
+    # every later one on this connection lock for nothing. So a verdict whose
+    # transaction has ended counts as gone, whether or not its hook ran.
     def remember_stale_snapshot!
       remembered = remembered_stale_snapshots
       key = stale_snapshot_key
-      return if remembered.include?(key)
+      return if remembered.key?(key)
 
-      remembered << key
-      at_end_of_real_transaction(self.class.connection) { remembered.delete(key) }
+      connection = self.class.connection
+      remembered[key] = real_transaction(connection)
+      at_end_of_real_transaction(connection) { remembered.delete(key) }
     end
 
     # Per thread, and per connection inside it: a verdict is about one
-    # connection's database transaction, never another's.
+    # connection's database transaction, never another's. Each maps to the
+    # real transaction it was reached in, and one whose transaction has ended
+    # is dropped on the way out.
     def remembered_stale_snapshots
-      ActiveSupport::IsolatedExecutionState[:wallets_stale_snapshots] ||= Set.new
+      remembered = ActiveSupport::IsolatedExecutionState[:wallets_stale_snapshots] ||= {}
+      remembered.delete_if { |_key, transaction| transaction&.state&.finalized? }
+    end
+
+    # The outermost transaction open on `connection`: the real database
+    # transaction, whose snapshot a verdict is about. Active Record keeps no
+    # public pointer from a savepoint to its parent, so this reads the
+    # transaction manager's stack, an internal structure (the same on Rails
+    # 7.2 and 8.1). Its state is public: `finalized?` once it commits or
+    # rolls back, on both versions (7.2's `open?` stays true to the end, so
+    # it cannot tell). Should a later Rails change the stack, this answers
+    # nil, and the verdict then lasts until its hook ends it, exactly as long
+    # as it used to: never shorter, which would read a stale snapshot. The
+    # current transaction is no substitute, as it may be a savepoint that
+    # ends long before the real transaction does.
+    def real_transaction(connection)
+      manager = connection.transaction_manager
+      return unless manager.instance_variable_defined?(:@stack)
+
+      manager.instance_variable_get(:@stack).first
     end
 
     def stale_snapshot_key
@@ -744,6 +817,11 @@ module Wallets
     # `transaction(joinable: false)` runs its commit hooks at once, with the
     # real transaction (and its snapshot) still open. So each hook hands the
     # block on to the next transaction out, until none is left.
+    #
+    # The hooks go on Active Record's internal transaction, not on the public
+    # `ActiveRecord::Transaction` it exposes: a `transaction(joinable: false)`
+    # exposes the null transaction, whose `after_commit` runs at once, and
+    # would end a verdict while its transaction still runs.
     def at_end_of_real_transaction(connection, &block)
       transaction = connection.current_transaction
       return yield unless transaction.open?
@@ -821,89 +899,230 @@ module Wallets
 
     # The debit, and the allocations that fund it, each holding the very
     # source row the allocator locked (a transfer keeps their expirations).
-    def apply_debit_with_allocations(amount, metadata:, category:, transfer:, extra_attributes: {}, allow_unbacked: allow_negative_balance?, at: evaluation_time)
+    # `from:` is the credits a targeted debit names (see `named_credits`).
+    def apply_debit_with_allocations(amount, metadata:, category:, transfer:, extra_attributes: {}, allow_unbacked: allow_negative_balance?, from: nil, at: evaluation_time)
       mutating_at(at) do
         amount = normalize_positive_amount!(amount)
         previous_balance = balance
 
-        if amount > previous_balance && !allow_unbacked
+        buckets = named_buckets!(from, amount, previous_balance, metadata) if from
+        if from.nil? && amount > previous_balance && !allow_unbacked
           reject_insufficient_balance!(amount, previous_balance, metadata)
         end
 
-        spend_transaction = transactions.create!(
-          {
-            amount: -amount,
-            category: category,
-            metadata: metadata,
-            transfer: transfer
-          }.merge(extra_attributes)
+        # A targeted debit is never left unbacked, whatever the flag says.
+        spend_transaction, allocations = post_debit!(
+          amount,
+          metadata: metadata,
+          category: category,
+          transfer: transfer,
+          extra_attributes: extra_attributes,
+          buckets: buckets,
+          allow_unbacked: allow_unbacked && from.nil?
         )
 
-        allocations = allocate_debit!(spend_transaction, amount)
-        remaining_to_allocate = amount - allocations.sum(&:amount)
-
-        if remaining_to_allocate.positive? && !allow_unbacked
-          raise InsufficientBalance, "Not enough balance buckets to cover the debit"
-        end
-
         new_balance = refresh_cached_balance!
-        spend_transaction.sync_balance_snapshot!(before: previous_balance, after: new_balance)
-
-        dispatch_callback(:debited,
-          wallet: self,
-          amount: amount,
-          category: category,
-          transaction: spend_transaction,
-          previous_balance: previous_balance,
-          new_balance: new_balance,
-          metadata: metadata)
-
+        report_debit!(spend_transaction, amount: amount, category: category, metadata: metadata, previous_balance: previous_balance, new_balance: new_balance)
         dispatch_balance_threshold_callbacks!(previous_balance, new_balance)
 
         [spend_transaction, allocations]
       end
     end
 
-    # Allocates `amount` of the debit to eligible buckets and returns the
-    # allocations, in order. Whatever no bucket can back is left unbacked.
-    def allocate_debit!(spend_transaction, amount)
-      remaining_to_allocate = amount
-      allocations = []
+    # Writes a debit and the allocations that fund it: from `buckets` when
+    # given, else from eligible credits. Whatever no bucket backs is left
+    # unbacked, which only `allow_unbacked` permits. Funding has been checked
+    # by then; this only refuses to write a debit that does not add up.
+    def post_debit!(amount, metadata:, category:, transfer:, extra_attributes: {}, buckets: nil, allow_unbacked: false)
+      spend_transaction = transactions.create!(
+        {
+          amount: -amount,
+          category: category,
+          metadata: metadata,
+          transfer: transfer
+        }.merge(extra_attributes)
+      )
 
-      # Only eligible buckets fund a debit (see `eligible_credits`).
-      # Reservations pin no bucket: affordability enforces them, so ordinary
-      # debits leave them backed by the longest-lived buckets.
-      #
-      # Soonest-expiring buckets are consumed first so expirable value never
-      # sits unused behind evergreen value; ties (including all-evergreen
-      # wallets) fall back to oldest-first.
-      #
-      # Each bucket's remaining value comes from the same locked statement
-      # that loads it, so allocation decides on current rows (see
-      # `current_reads_need_locks?`), never on an older snapshot.
-      positive_transactions = eligible_credits
+      allocations = allocate_debit!(spend_transaction, amount, buckets: buckets)
+      remaining_to_allocate = amount - allocations.sum(&:amount)
+
+      if remaining_to_allocate.positive? && !allow_unbacked
+        raise InsufficientBalance, "Not enough balance buckets to cover the debit"
+      end
+
+      [spend_transaction, allocations]
+    end
+
+    # The debit's balance snapshot and its `debited` callback, from the
+    # balances before and after the whole command.
+    def report_debit!(spend_transaction, amount:, category:, metadata:, previous_balance:, new_balance:)
+      spend_transaction.sync_balance_snapshot!(before: previous_balance, after: new_balance)
+
+      dispatch_callback(:debited,
+        wallet: self,
+        amount: amount,
+        category: category,
+        transaction: spend_transaction,
+        previous_balance: previous_balance,
+        new_balance: new_balance,
+        metadata: metadata)
+    end
+
+    # Allocates `amount` of the debit to buckets and returns the allocations,
+    # in order: the named `buckets` of a targeted debit, else every eligible
+    # credit (see `eligible_buckets`). Whatever no bucket can back is left
+    # unbacked.
+    def allocate_debit!(spend_transaction, amount, buckets: nil)
+      split_across(buckets || eligible_buckets, amount).map do |source_transaction, portion|
+        allocation_class.create!(
+          spend_transaction: spend_transaction,
+          source_transaction: source_transaction,
+          amount: portion
+        )
+      end
+    end
+
+    # The buckets an ordinary debit walks, locked, in the order it spends
+    # them.
+    #
+    # Only eligible buckets fund a debit (see `eligible_credits`).
+    # Reservations pin no bucket: affordability enforces them, so ordinary
+    # debits leave them backed by the longest-lived buckets.
+    #
+    # Soonest-expiring buckets are consumed first so expirable value never
+    # sits unused behind evergreen value; ties (including all-evergreen
+    # wallets) fall back to oldest-first.
+    #
+    # Each bucket's remaining value comes from the same locked statement
+    # that loads it, so allocation decides on current rows (see
+    # `current_reads_need_locks?`), never on an older snapshot.
+    def eligible_buckets
+      eligible_credits
         .select(transaction_class.arel_table[Arel.star], Arel.sql("#{remaining_amount_sql} AS allocatable_amount"))
         .order(Arel.sql("COALESCE(expires_at, '9999-12-31 23:59:59'), id ASC"))
         .lock("FOR UPDATE")
         .to_a
+    end
 
-      positive_transactions.each do |source_transaction|
-        leftover = source_transaction.allocatable_amount.to_i
-        next if leftover <= 0
+    # Splits `amount` across `buckets` in their order: each gives what it has
+    # left until nothing is left to take. Returns [bucket, portion] pairs;
+    # their sum falls short of `amount` only when the buckets run out.
+    def split_across(buckets, amount)
+      remaining_to_allocate = amount
 
-        allocation_amount = [leftover, remaining_to_allocate].min
+      buckets.each_with_object([]) do |bucket, portions|
+        break portions unless remaining_to_allocate.positive?
 
-        allocations << allocation_class.create!(
-          spend_transaction: spend_transaction,
-          source_transaction: source_transaction,
-          amount: allocation_amount
-        )
+        portion = [bucket.allocatable_amount.to_i, remaining_to_allocate].min
+        next unless portion.positive?
 
-        remaining_to_allocate -= allocation_amount
-        break if remaining_to_allocate <= 0
+        portions << [bucket, portion]
+        remaining_to_allocate -= portion
+      end
+    end
+
+    # =========================================
+    # Targeted Debit Implementation (`from:`)
+    # =========================================
+
+    # The credits `from:` names, as far as they can be checked without the
+    # ledger: one saved credit of this ledger, or a list of distinct ones, in
+    # the caller's order. nil when `from:` was left out. Whose they are, and
+    # whether they are unexpired credits, is read under the wallet lock (see
+    # `named_buckets!`), never taken from the caller's copies.
+    def named_credits(from)
+      return if from.equal?(ELIGIBLE_CREDITS)
+
+      ensure_holds_enabled!
+      raise ArgumentError, "from: is nil; leave it out to spend any eligible credit" if from.nil?
+
+      credits = Array.wrap(from)
+      raise ArgumentError, "from: names no credit" if credits.empty?
+
+      credits.each do |credit|
+        unless credit.instance_of?(transaction_class)
+          raise ArgumentError, "from: takes #{transaction_class.name} credits, not #{credit.class.name}"
+        end
+        raise ArgumentError, "from: takes saved credits only" unless credit.persisted?
       end
 
-      allocations
+      repeated = credits.map(&:id).tally.select { |_id, count| count > 1 }.keys
+      raise ArgumentError, "from: names transaction #{repeated.join(", ")} more than once" if repeated.any?
+
+      credits
+    end
+
+    # The named credits, read again under the wallet lock in the caller's
+    # order, once they are known to fund `amount` (D7, D8). Returns them as
+    # the buckets to allocate from; raises otherwise, before anything is
+    # written.
+    #
+    # - Every one is a credit of this wallet, unexpired at this instant:
+    #   allocating from an expired credit would hand on value that no longer
+    #   exists, whatever a transfer's expiration policy.
+    # - Together they hold at least `amount`: a targeted debit is allocated
+    #   to them in full, never to other credits and never to debt.
+    # - With overdrafts off, the part they give from unheld value must fit in
+    #   the available balance, floored at zero. Held value is not part of
+    #   the available balance, so taking it needs no funding; unheld value
+    #   is, so naming an unheld credit can neither spend what a reservation
+    #   set aside nor deepen a deficit.
+    def named_buckets!(credits, amount, available, metadata)
+      buckets = locked_named_buckets(credits)
+      portions = split_across(buckets, amount)
+      found = portions.sum { |_bucket, portion| portion }
+      covered_consumed = portions.sum { |bucket, portion| covered_bucket?(bucket) ? portion : 0 }
+
+      if found < amount
+        reject_insufficient_balance!(amount, available, metadata,
+          comparison: "#{found} < #{amount} in the named credits",
+          covered_consumed: covered_consumed)
+      end
+
+      needed = amount - covered_consumed
+      if needed > [available, 0].max && !allow_negative_balance?
+        reject_insufficient_balance!(amount, available, metadata,
+          comparison: covered_consumed.zero? ? "#{available} < #{amount}" : "#{available} < #{amount} - #{covered_consumed} from held credits",
+          covered_consumed: covered_consumed)
+      end
+
+      buckets
+    end
+
+    # One locked statement, like the buckets an ordinary debit walks: each
+    # named credit with its remaining value and whether an active hold covers
+    # it, all at this instant and as the rows are now.
+    def locked_named_buckets(credits)
+      at = evaluation_time
+      rows = transactions.where(id: credits.map(&:id))
+        .select(
+          transaction_class.arel_table[Arel.star],
+          Arel.sql("#{remaining_amount_sql} AS allocatable_amount"),
+          Arel.sql("CASE WHEN #{self.class.coverage_sql(at: at, lock: current_reads?)} THEN 1 ELSE 0 END AS covered_bucket")
+        )
+        .lock("FOR UPDATE")
+        .index_by(&:id)
+
+      credits.map do |credit|
+        row = rows[credit.id] || raise(ArgumentError, missing_credit_message(credit))
+        raise ArgumentError, "Transaction #{credit.id} is a debit: only credits can fund a targeted debit" unless row.credit?
+        raise ArgumentError, "Credit #{credit.id} has expired" if row.expired?(at: at)
+
+        row
+      end
+    end
+
+    # Read from the flag `locked_named_buckets` selects with each row.
+    def covered_bucket?(bucket)
+      bucket.read_attribute(:covered_bucket).to_i == 1
+    end
+
+    def missing_credit_message(credit)
+      if transaction_class.where(id: credit.id).exists?
+        "Transaction #{credit.id} belongs to another wallet"
+      else
+        "Transaction #{credit.id} no longer exists"
+      end
     end
 
     # =========================================
@@ -933,7 +1152,7 @@ module Wallets
     def release_hold!(hold, reason:, metadata:)
       metadata = normalize_metadata(metadata)
 
-      with_lock(requires_new: true) do
+      ending_hold(hold) do
         mutating_at(Time.current) do
           # A locking read: the hold as it is now, whatever an earlier read in
           # this transaction saw.
@@ -944,16 +1163,100 @@ module Wallets
             hold.update!(released_at: evaluation_time, release_reason: reason, release_metadata: metadata)
             new_balance = refresh_cached_balance!
 
-            dispatch_callback(:hold_released,
-              wallet: self,
-              hold: hold,
-              previous_balance: previous_balance,
-              new_balance: new_balance,
-              metadata: hold.release_metadata)
+            dispatch_hold_released!(hold, previous_balance: previous_balance, new_balance: new_balance)
           end
 
           hold
         end
+      end
+    end
+
+    # Runs a command that ends `hold`, a release or a capture, under the
+    # wallet lock and in its own savepoint. Should it fail, the caller's copy
+    # of the hold is read back from the ledger: Active Record leaves a record
+    # holding the values a rolled-back write gave it, so the copy would
+    # otherwise go on reading released (or captured, linked to a debit that
+    # never existed), and a retry that checks `active?` or `captured?` first
+    # would never run. If even that read fails, the original error is the
+    # one worth raising.
+    def ending_hold(hold, &block)
+      with_lock(requires_new: true, &block)
+    rescue => error
+      begin
+        hold.reload
+      rescue ActiveRecord::ActiveRecordError
+        nil
+      end
+      raise error
+    end
+
+    # The wallet side of `Hold#capture!`: one composite step (D9). The wallet
+    # is locked first and the reservation read as it is now, exactly like a
+    # release, so a capture racing a release or another capture finds the
+    # reservation already ended and creates nothing.
+    #
+    # The reservation becomes the debit: the amount it set aside funds its
+    # own capture, while every other reservation stays fully in force. The
+    # debit spends eligible credits only, like any ordinary debit, so value
+    # a hold covers is never captured. The balances the debit's snapshot and
+    # the callbacks report are the ones before and after the whole step,
+    # never the instant in between where the reservation is gone and the
+    # debit not yet posted: capturing a fully reserved wallet reads 0 -> 0.
+    def capture_reservation!(reservation, amount, category:, metadata:)
+      amount = normalize_positive_amount!(amount) unless amount.nil?
+      metadata = normalize_metadata(metadata)
+
+      ending_hold(reservation) do
+        mutating_at(Time.current) do
+          # A locking read: the reservation as it is now, whatever an earlier
+          # read in this transaction saw.
+          reservation.lock!
+          ensure_capturable!(reservation)
+
+          amount ||= reservation.amount
+          if amount > reservation.amount
+            raise ArgumentError, "Cannot capture #{amount}: reservation #{reservation.id} sets aside #{reservation.amount}"
+          end
+
+          previous_balance = balance
+          available_for_capture = previous_balance + reservation.amount
+
+          if amount > available_for_capture && !allow_negative_balance?
+            reject_insufficient_balance!(amount, previous_balance, metadata,
+              comparison: "#{available_for_capture} < #{amount} to capture reservation #{reservation.id}",
+              available_for_capture: available_for_capture)
+          end
+
+          # With overdrafts on, a capture beyond the eligible credits leaves
+          # exactly the rest unbacked; one within them leaves no debt at all,
+          # however underfunded the other reservations end up.
+          debit, _allocations = post_debit!(amount, metadata: metadata, category: category, transfer: nil, allow_unbacked: allow_negative_balance?)
+          reservation.update!(released_at: evaluation_time, release_reason: "captured", capture_transaction: debit)
+          new_balance = refresh_cached_balance!
+
+          report_debit!(debit, amount: amount, category: category, metadata: metadata, previous_balance: previous_balance, new_balance: new_balance)
+          dispatch_hold_released!(reservation, previous_balance: previous_balance, new_balance: new_balance, transaction: debit)
+          dispatch_balance_threshold_callbacks!(previous_balance, new_balance)
+
+          debit
+        end
+      end
+    end
+
+    # Only an active reservation can be captured, and only once. Read at the
+    # command's instant: a reservation is gone from its deadline on.
+    def ensure_capturable!(reservation)
+      unless reservation.reservation?
+        raise InvalidHold, "Hold #{reservation.id} holds credit value: only a reservation can be captured"
+      end
+      if reservation.captured?
+        raise InvalidHold, "Reservation #{reservation.id} was already captured (transaction #{reservation.capture_transaction_id})"
+      end
+      if reservation.released?
+        raise InvalidHold, "Reservation #{reservation.id} was released and can no longer be captured"
+      end
+      unless reservation.active?(at: evaluation_time)
+        raise InvalidHold, "Reservation #{reservation.id} lapsed at #{reservation.releases_at.iso8601} and can no longer be captured"
       end
     end
 
@@ -1045,6 +1348,20 @@ module Wallets
         previous_balance: previous_balance,
         new_balance: new_balance,
         metadata: hold.metadata)
+    end
+
+    # The same shape as `hold_created`, with the release metadata, and the
+    # debit a capture posted as the `transaction`.
+    def dispatch_hold_released!(hold, previous_balance:, new_balance:, transaction: nil)
+      dispatch_callback(:hold_released,
+        wallet: self,
+        hold: hold,
+        amount: hold.amount,
+        category: hold.category,
+        transaction: transaction,
+        previous_balance: previous_balance,
+        new_balance: new_balance,
+        metadata: hold.release_metadata)
     end
 
     # =========================================
@@ -1258,9 +1575,11 @@ module Wallets
     # `touch`, which writes nothing under `no_touching`.
     #
     # `update!` rather than assigning and then saving: if the command's
-    # savepoint rolls back afterwards, Active Record restores the wallet as it
-    # was when the write began, and that must be the clean wallet, never one
-    # with the new balance pending (which no later command could lock).
+    # savepoint rolls back afterwards, Active Record leaves the wallet with no
+    # pending changes, so its next command can lock it. It is clean, not
+    # restored: it keeps the rolled-back `balance` and `updated_at` in memory
+    # until that lock reloads the row. Assigning first would leave the new
+    # balance pending instead, and no later command could lock the wallet.
     def refresh_cached_balance!
       available = current_balance
       marker = next_row_marker
@@ -1308,17 +1627,22 @@ module Wallets
     # A refused funding attempt reports once, immediately (its transaction is
     # about to roll back), and names what holds keep out of reach, so the app
     # can say "20 available, 30 held, 50 reserved" rather than just "20".
-    def reject_insufficient_balance!(amount, available, metadata)
+    #
+    # `available` is always the wallet's available balance, which nothing
+    # moved. A command funded by something else says what it compared in
+    # `comparison` (a capture counts its own reservation back in) and adds
+    # the figures behind it to the metadata (`diagnostics`).
+    def reject_insufficient_balance!(amount, available, metadata, comparison: "#{available} < #{amount}", **diagnostics)
       held, reserved = held_and_reserved
-      dispatch_insufficient_balance!(amount, available, metadata, held: held, reserved: reserved)
+      dispatch_insufficient_balance!(amount, available, metadata, held: held, reserved: reserved, **diagnostics)
 
       details = {held: held, reserved: reserved}.reject { |_name, value| value.zero? }.map { |name, value| "#{value} #{name}" }
-      raise InsufficientBalance, "Insufficient balance (#{available} < #{amount}#{"; #{details.join(", ")}" if details.any?})"
+      raise InsufficientBalance, "Insufficient balance (#{comparison}#{"; #{details.join(", ")}" if details.any?})"
     end
 
     # `held:` is the credit value holds cover and `reserved:` the active
     # reservations, so available + held + reserved is the total balance.
-    def dispatch_insufficient_balance!(amount, previous_balance, metadata, held: nil, reserved: nil)
+    def dispatch_insufficient_balance!(amount, previous_balance, metadata, held: nil, reserved: nil, **diagnostics)
       held, reserved = held_and_reserved if held.nil? || reserved.nil?
 
       dispatch_callback(:insufficient,
@@ -1330,7 +1654,8 @@ module Wallets
           available: previous_balance,
           required: amount,
           held: held,
-          reserved: reserved
+          reserved: reserved,
+          **diagnostics
         ))
     end
 

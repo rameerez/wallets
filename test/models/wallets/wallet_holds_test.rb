@@ -475,6 +475,29 @@ class Wallets::WalletHoldsTest < ActiveSupport::TestCase
     assert_raises(Wallets::InsufficientBalance) { wallet.debit(1, category: :purchase) }
   end
 
+  test "a release succeeds while available balance is negative with overdrafts off" do
+    # The other half of D6: giving value back must never be refused for the
+    # deficit it reduces, whichever hold goes first.
+    refute Wallets.configuration.allow_negative_balance
+    wallet = points_wallet
+    credit = wallet.credit(100, category: :reward)
+    reservation = wallet.reserve(80, category: :booking)
+    fraud = wallet.hold(credit, category: :fraud_review)
+    second_reason = wallet.hold(credit, category: :dispute)
+    assert_equal(-80, wallet.balance)
+
+    second_reason.release!
+    assert_equal(-80, wallet.balance, "another reason still holds the credit")
+
+    reservation.release!(reason: "cancelled")
+    assert_equal 0, wallet.balance
+    assert_equal 0, wallet.reload.read_attribute(:balance)
+
+    fraud.release!
+    assert_equal [100, 0, 100], [wallet.balance, wallet.held_balance, wallet.total_balance]
+    assert [reservation, fraud, second_reason].all? { |hold| hold.reload.released? }
+  end
+
   test "expiry can take available balance below zero and the wallet stays saveable" do
     wallet = points_wallet
     wallet.credit(100, category: :reward, expires_at: 1.day.from_now)
