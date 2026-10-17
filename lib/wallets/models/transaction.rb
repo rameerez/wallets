@@ -74,15 +74,17 @@ module Wallets
     # `not_expired` and `expired` partition all transactions at any instant:
     # a transaction expiring exactly "now" is already expired, matching the
     # balance math, which only counts buckets that are strictly still alive.
-    scope :not_expired, -> { where(arel_table[:expires_at].eq(nil).or(arel_table[:expires_at].gt(Time.current))) }
-    scope :expired, -> { where(arel_table[:expires_at].lteq(Time.current)) }
+    # `at:` lets a mutation read the whole ledger at the one instant it
+    # sampled under the wallet lock.
+    scope :not_expired, ->(at: Time.current) { where(arel_table[:expires_at].eq(nil).or(arel_table[:expires_at].gt(at))) }
+    scope :expired, ->(at: Time.current) { where(arel_table[:expires_at].lteq(at)) }
 
     def owner
       wallet.owner
     end
 
-    def expired?
-      expires_at.present? && expires_at <= Time.current
+    def expired?(at: Time.current)
+      expires_at.present? && expires_at <= at
     end
 
     def credit?
@@ -113,6 +115,30 @@ module Wallets
       amount.abs - spent_amount
     end
 
+    # The part of this credit's remaining value an active hold keeps out of
+    # the available balance: all of it while a hold on this credit or on its
+    # whole wallet is active, otherwise none. Expired value is gone, not held,
+    # so expiry zeroes this while the hold rows stay readable as reasons.
+    #
+    # Wallet reservations are not apportioned among credits: they are an
+    # amount of the wallet, enforced when it spends, never a claim on a
+    # particular bucket.
+    def held_amount(at: Time.current)
+      covered?(at: at) ? remaining_amount : 0
+    end
+
+    # What this credit can still fund at `at`: nothing once expired or held.
+    # Debits fund nothing.
+    def available_amount(at: Time.current)
+      return 0 unless credit? && !expired?(at: at)
+
+      covered?(at: at) ? 0 : remaining_amount
+    end
+
+    def held?(at: Time.current)
+      held_amount(at: at).positive?
+    end
+
     def balance_before
       metadata[:balance_before]
     end
@@ -135,10 +161,42 @@ module Wallets
         errors.add(:base, "Allocated amount exceeds transaction amount")
       end
     end
+
+    # Asks the wallet class for its one definition of "held" (the same SQL
+    # behind `held_balance` and FEFO eligibility), so a credit can never read
+    # as held while the wallet spends it, or the other way round. Ledgers
+    # without holds answer without a single hold query.
+    def covered?(at:)
+      return false unless persisted? && credit? && !expired?(at: at)
+
+      wallet_class = association(:wallet).klass
+      return false unless wallet_class.holds_enabled?
+
+      self.class.where(id: id).where(wallet_class.coverage_sql(at: at)).exists?
+    end
   end
 
   # The concrete standalone ledger model (table: wallets_transactions via the
   # default config). Embedders subclass TransactionBase instead.
+  #
+  # Hold associations live here, never on TransactionBase: a ledger keeps
+  # holds only when it opts in (`WalletBase.hold_class_name`), and a ledger
+  # that did not must never touch a holds table, not even on destroy.
   class Transaction < TransactionBase
+    # The reasons this credit is held. Destroying the credit destroys them.
+    has_many :holds,
+      class_name: "Wallets::Hold",
+      foreign_key: :transaction_id,
+      inverse_of: :credit,
+      dependent: :destroy
+
+    # The reservation this debit captured, if any. Deliberately no
+    # `dependent:`: nullifying the link could leave a reservation reading
+    # "captured" with no debit to show for it, so the foreign key protects it
+    # instead. Wallet destruction removes holds before transactions.
+    has_one :captured_reservation,
+      class_name: "Wallets::Hold",
+      foreign_key: :capture_transaction_id,
+      inverse_of: :capture_transaction
   end
 end

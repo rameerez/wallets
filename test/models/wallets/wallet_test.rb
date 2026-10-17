@@ -202,13 +202,14 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     assert_equal(-15, credit.balance_after)
   end
 
-  test "flipping allow_negative_balance off while a wallet is negative makes subsequent saves fail" do
-    # Documented gotcha: `allow_negative_balance` is meant to be a stable
-    # config decision, not a runtime toggle. The wallet model carries a
-    # `balance >= 0` validation gated on the flag; flipping the flag off
-    # while wallets are below zero leaves them un-saveable, which means
-    # any further `credit` / `debit` (both call `refresh_cached_balance!`
-    # internally, which calls `save!`) raises a validation error.
+  test "flipping allow_negative_balance off while a wallet is negative leaves it saveable" do
+    # The 0.2/0.3 gotcha is gone (0.4, D6): the wallet used to carry a
+    # `balance >= 0` validation gated on the flag, so flipping the flag off
+    # while a wallet was below zero made every later `credit` / `debit` raise
+    # RecordInvalid from `refresh_cached_balance!`. Available balance is now
+    # signed: holds and expiry can take it below zero with overdrafts off, so
+    # a save-time floor would reject the very credit that repays the debt.
+    # The flag keeps its real job: refusing commands that exceed funding.
     Wallets.configuration.allow_negative_balance = true
     owner = users(:new_user)
     wallet = create_wallet(owner, asset_code: :credits, initial_balance: 0)
@@ -221,15 +222,11 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     # AR's "no unpersisted changes" guard. Apps reach this branch by
     # calling `user.wallet(:foo).credit(...)` after a flag flip; this
     # mirrors that.
-    error = assert_raises(ActiveRecord::RecordInvalid) do
-      owner.wallet(:credits).credit(5, category: :reward)
-    end
-    assert_includes error.message, "Balance must be greater than or equal to 0"
-
-    # Recovery: flip the flag back on.
-    Wallets.configuration.allow_negative_balance = true
     owner.wallet(:credits).credit(5, category: :reward)
+
     assert_equal(-15, owner.wallet(:credits).balance)
+    assert_equal(-15, owner.wallet(:credits).read_attribute(:balance), "the cached column stores the signed balance")
+    assert_raises(Wallets::InsufficientBalance) { owner.wallet(:credits).debit(1, category: :purchase) }
   end
 
   test "concurrent debits on the same wallet serialize through with_lock and accumulate correctly" do

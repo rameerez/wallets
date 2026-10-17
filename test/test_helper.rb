@@ -52,4 +52,27 @@ class ActiveSupport::TestCase
       initial_balance: initial_balance
     )
   end
+
+  # Hold rows written straight to the table: a credit hold when given a
+  # credit, else a wallet hold. Commands that create holds under the wallet
+  # lock come later; these pin the model and the balance math under them.
+  def hold!(wallet, credit = nil, category: :review, **attributes)
+    Wallets::Hold.create!(wallet: wallet, credit: credit, category: category, **attributes)
+  end
+
+  def reservation!(wallet, amount, category: :booking, **attributes)
+    Wallets::Hold.create!(wallet: wallet, amount: amount, category: category, **attributes)
+  end
+
+  # Every SQL statement the block runs, schema and transaction noise aside.
+  def capture_sql
+    statements = []
+    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
+      statements << payload[:sql] unless payload[:name] == "SCHEMA" || payload[:sql].match?(/\A\s*(BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)/i)
+    end
+    yield
+    statements
+  ensure
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+  end
 end

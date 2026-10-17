@@ -7,39 +7,66 @@ module Wallets
   #
   # MySQL cannot give JSON columns a default, so a NULL column is treated the
   # same as an empty hash everywhere.
+  #
+  # Including the concern gives the `metadata` column this behavior. A model
+  # with another JSON column of the same kind names it:
+  #
+  #   has_metadata_column :release_metadata
   module HasMetadata
     extend ActiveSupport::Concern
 
     included do
+      class_attribute :metadata_column_names, default: [].freeze, instance_writer: false, instance_predicate: false
+
       before_save :sync_metadata_cache
+
+      has_metadata_column :metadata
     end
 
-    # read_attribute/write_attribute, NOT `super`: this concern is included on
-    # the abstract *Base classes, while ActiveRecord generates the plain
-    # attribute readers/writers lazily on each CONCRETE descendant — below
-    # this module in the ancestor chain — so a `super` here can find no
-    # generated method to call.
-    def metadata
-      @indifferent_metadata ||= ActiveSupport::HashWithIndifferentAccess.new(read_attribute(:metadata) || {})
-    end
+    class_methods do
+      def has_metadata_column(name)
+        name = name.to_sym
+        cache = :"@indifferent_#{name}"
+        self.metadata_column_names = (metadata_column_names + [name]).freeze
 
-    def metadata=(hash)
-      @indifferent_metadata = nil
-      write_attribute(:metadata, hash.respond_to?(:to_h) ? hash.to_h : {})
+        # A module, not methods on the class itself, so the including class
+        # can still override an accessor and call `super`.
+        #
+        # read_attribute/write_attribute, NOT `super`: this concern is included
+        # on the abstract *Base classes, while ActiveRecord generates the plain
+        # attribute readers/writers lazily on each CONCRETE descendant — below
+        # this module in the ancestor chain — so a `super` here can find no
+        # generated method to call.
+        include(Module.new do
+          define_method(name) do
+            instance_variable_get(cache) ||
+              instance_variable_set(cache, ActiveSupport::HashWithIndifferentAccess.new(read_attribute(name) || {}))
+          end
+
+          define_method(:"#{name}=") do |hash|
+            instance_variable_set(cache, nil)
+            write_attribute(name, hash.respond_to?(:to_h) ? hash.to_h : {})
+          end
+        end)
+      end
     end
 
     def reload(*)
-      @indifferent_metadata = nil
+      metadata_column_names.each { |name| instance_variable_set(:"@indifferent_#{name}", nil) }
       super
     end
 
     private
 
     def sync_metadata_cache
-      if @indifferent_metadata
-        write_attribute(:metadata, @indifferent_metadata.to_h)
-      elsif read_attribute(:metadata).nil?
-        write_attribute(:metadata, {})
+      metadata_column_names.each do |name|
+        cached = instance_variable_get(:"@indifferent_#{name}")
+
+        if cached
+          write_attribute(name, cached.to_h)
+        elsif read_attribute(name).nil?
+          write_attribute(name, {})
+        end
       end
     end
   end

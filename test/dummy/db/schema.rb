@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[7.2].define(version: 2025_02_12_181807) do
+ActiveRecord::Schema[7.2].define(version: 2026_10_17_120000) do
   create_table "users", force: :cascade do |t|
     t.string "email"
     t.string "name"
@@ -28,6 +28,28 @@ ActiveRecord::Schema[7.2].define(version: 2025_02_12_181807) do
     t.index ["transaction_id", "source_transaction_id"], name: "index_wallets_allocations_on_tx_and_source_tx"
     t.index ["transaction_id"], name: "index_wallets_allocations_on_transaction_id"
     t.check_constraint "amount > 0", name: "check_wallets_allocations_amount_positive"
+  end
+
+  create_table "wallets_holds", force: :cascade do |t|
+    t.bigint "wallet_id", null: false
+    t.bigint "transaction_id"
+    t.bigint "capture_transaction_id"
+    t.bigint "amount"
+    t.string "category", null: false
+    t.datetime "releases_at"
+    t.datetime "released_at"
+    t.string "release_reason"
+    t.json "metadata", default: {}, null: false
+    t.json "release_metadata", default: {}, null: false
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["capture_transaction_id"], name: "index_wallets_holds_on_capture_tx", unique: true
+    t.index ["releases_at"], name: "index_wallets_holds_on_releases_at"
+    t.index ["transaction_id", "released_at"], name: "index_wallets_holds_on_tx_and_released_at"
+    t.index ["wallet_id", "released_at"], name: "index_wallets_holds_on_wallet_and_released_at"
+    t.check_constraint "amount IS NULL OR amount > 0", name: "check_wallets_holds_amount_positive"
+    t.check_constraint "capture_transaction_id IS NULL OR (transaction_id IS NULL AND amount IS NOT NULL AND released_at IS NOT NULL)", name: "check_wallets_holds_capture_ends_reservation"
+    t.check_constraint "transaction_id IS NULL OR amount IS NULL", name: "check_wallets_holds_credit_hold_has_no_amount"
   end
 
   create_table "wallets_transactions", force: :cascade do |t|
@@ -79,6 +101,9 @@ ActiveRecord::Schema[7.2].define(version: 2025_02_12_181807) do
 
   add_foreign_key "wallets_allocations", "wallets_transactions", column: "source_transaction_id"
   add_foreign_key "wallets_allocations", "wallets_transactions", column: "transaction_id"
+  add_foreign_key "wallets_holds", "wallets_transactions", column: "capture_transaction_id"
+  add_foreign_key "wallets_holds", "wallets_transactions", column: "transaction_id"
+  add_foreign_key "wallets_holds", "wallets_wallets", column: "wallet_id"
   add_foreign_key "wallets_transactions", "wallets_transfers", column: "transfer_id"
   add_foreign_key "wallets_transactions", "wallets_wallets", column: "wallet_id"
   add_foreign_key "wallets_transfers", "wallets_wallets", column: "from_wallet_id"

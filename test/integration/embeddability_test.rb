@@ -424,6 +424,94 @@ class EmbeddabilityTest < ActiveSupport::TestCase
     assert_equal "ORDER-42", transaction.source_reference
   end
 
+  # ───────────────────────────────────────────────────────────────────────────
+  # Holds are opt-in: this embedded ledger never enabled them
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "an embedded ledger keeps no holds unless it opts in" do
+    refute EmbeddedWallet.holds_enabled?
+    assert_nil EmbeddedWallet.hold_class_name
+    assert_raises(Wallets::HoldsNotEnabled) { EmbeddedWallet.hold_class }
+    refute EmbeddedTransaction.reflect_on_association(:holds), "hold associations belong to opted-in classes only"
+    refute EmbeddedWallet.reflect_on_association(:holds)
+  end
+
+  test "a ledger without holds never touches a holds table, destroy included" do
+    sender = EmbeddedWallet.create_for_owner!(owner: users(:rich_user), asset_code: :plain_points, initial_balance: 100)
+    recipient = EmbeddedWallet.create_for_owner!(owner: users(:peer_user), asset_code: :plain_points)
+    EmbeddabilityTest.embedded_config.allow_negative_balance = true
+
+    statements = capture_sql do
+      credit = sender.credit(50, category: :embedded_reward, expires_at: 10.days.from_now)
+      debit = sender.debit(30, category: :embedded_charge)
+      sender.transfer_to(recipient, 40, category: :peer_payment)
+      sender.debit(500, category: :embedded_charge)
+      EmbeddabilityTest.embedded_config.allow_negative_balance = false
+      assert_raises(Wallets::InsufficientBalance) { sender.debit(10, category: :embedded_charge) }
+
+      [sender, recipient].each do |wallet|
+        wallet.balance
+        wallet.available_balance
+        wallet.held_balance
+        wallet.total_balance
+        wallet.on_hold?
+        wallet.has_enough_balance?(1)
+      end
+      [credit, debit].each do |transaction|
+        transaction.held_amount
+        transaction.available_amount
+        transaction.held?
+      end
+
+      recipient.destroy!
+      sender.destroy!
+    end
+
+    assert statements.any? { |sql| sql.match?(/embedded_transactions/) }, "the capture saw the ledger's own queries"
+    hold_statements = statements.grep(/holds/i)
+    assert_empty hold_statements, "a ledger without holds ran hold SQL:\n#{hold_statements.join("\n")}"
+  end
+
+  test "readers without holds delegate to the ledger's own balance policy" do
+    # usage_credits overrides `current_balance` (its refund debt stays
+    # ledger debt, its public balance is floored at zero). Without holds,
+    # available and total balance must be that very number.
+    floored = Class.new(EmbeddedWallet) do
+      def self.name
+        "EmbeddabilityTest::FlooredWallet"
+      end
+
+      def current_balance
+        [positive_remaining_balance - unbacked_negative_balance(transactions.debits.where(category: "embedded_charge")), 0].max
+      end
+    end
+    EmbeddabilityTest.embedded_config.allow_negative_balance = true
+    wallet = floored.create_for_owner!(owner: users(:new_user), asset_code: :floored, initial_balance: 10)
+    wallet.debit(25, category: :embedded_charge)
+
+    statements = capture_sql do
+      assert_equal 0, wallet.balance
+      assert_equal 0, wallet.available_balance
+      assert_equal 0, wallet.total_balance
+      assert_equal 0, wallet.held_balance
+      refute wallet.on_hold?
+    end
+
+    assert_empty statements.grep(/holds/i)
+    assert_equal 0, wallet.reload.read_attribute(:balance), "the override also decides the cached balance"
+  end
+
+  test "insufficient_balance on a ledger without holds reports nothing held or reserved" do
+    wallet = EmbeddedWallet.create_for_owner!(owner: users(:new_user), asset_code: :short, initial_balance: 5)
+
+    error = assert_raises(Wallets::InsufficientBalance) { wallet.debit(10, category: :embedded_charge) }
+
+    assert_equal "Insufficient balance (5 < 10)", error.message
+    event = EmbeddedCallbacks.events.find { |entry| entry[:event] == :embedded_insufficient }
+    assert_equal 0, event[:data][:metadata][:held]
+    assert_equal 0, event[:data][:metadata][:reserved]
+  end
+
   private
 
   def cleanup_embedded_records!
