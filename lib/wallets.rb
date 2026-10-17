@@ -19,6 +19,8 @@ module Wallets
   class Error < StandardError; end
   class InsufficientBalance < Error; end
   class InvalidTransfer < Error; end
+  class InvalidHold < Error; end
+  class HoldsNotEnabled < Error; end
 
   class << self
     attr_writer :configuration
@@ -50,5 +52,6 @@ require "wallets/models/wallet"
 require "wallets/models/transaction"
 require "wallets/models/allocation"
 require "wallets/models/transfer"
+require "wallets/models/hold"
 
 require "wallets/engine"

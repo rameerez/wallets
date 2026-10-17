@@ -12,7 +12,7 @@ module Wallets
   #
   # When `embedded_table_name` is not set, the table name is derived from the
   # provided config's `table_prefix` plus the model's `table_suffix`
-  # ("wallets", "transactions", "allocations", or "transfers").
+  # ("wallets", "transactions", "allocations", "transfers", or "holds").
   module Embeddable
     extend ActiveSupport::Concern
 

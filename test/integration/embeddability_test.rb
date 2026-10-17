@@ -70,6 +70,8 @@ class EmbeddabilityTest < ActiveSupport::TestCase
         connection.data_source_exists?("embedded_transactions") &&
         connection.data_source_exists?("embedded_transfers") &&
         connection.data_source_exists?("embedded_allocations") &&
+        connection.data_source_exists?("embedded_holds") &&
+        connection.column_exists?(:embedded_wallets, :ledger_revision) &&
         connection.column_exists?(:embedded_transfers, :expiration_policy) &&
         connection.column_exists?(:embedded_transactions, :source_reference)
     end
@@ -77,7 +79,7 @@ class EmbeddabilityTest < ActiveSupport::TestCase
     def rebuild_embedded_tables!
       connection = ActiveRecord::Base.connection
 
-      %i[embedded_allocations embedded_transactions embedded_transfers embedded_wallets].each do |table_name|
+      %i[embedded_holds embedded_allocations embedded_transactions embedded_transfers embedded_wallets].each do |table_name|
         connection.drop_table(table_name, if_exists: true)
       end
 
@@ -85,6 +87,7 @@ class EmbeddabilityTest < ActiveSupport::TestCase
         t.references :owner, polymorphic: true, null: false
         t.string :asset_code, null: false
         t.bigint :balance, null: false, default: 0
+        t.bigint :ledger_revision, null: false, default: 0 # every 0.4 wallet table has it
         t.public_send(json_column_type(connection), :metadata, null: false, default: json_column_default(connection))
         t.timestamps
       end
@@ -119,7 +122,21 @@ class EmbeddabilityTest < ActiveSupport::TestCase
         t.timestamps
       end
 
-      [EmbeddedWallet, EmbeddedTransaction, EmbeddedTransfer, EmbeddedAllocation].each(&:reset_column_information)
+      connection.create_table :embedded_holds do |t|
+        t.integer :wallet_id, null: false
+        t.integer :transaction_id
+        t.integer :capture_transaction_id
+        t.bigint :amount
+        t.string :category, null: false
+        t.datetime :releases_at
+        t.datetime :released_at
+        t.string :release_reason
+        t.public_send(json_column_type(connection), :metadata, null: false, default: json_column_default(connection))
+        t.public_send(json_column_type(connection), :release_metadata, null: false, default: json_column_default(connection))
+        t.timestamps
+      end
+
+      [EmbeddedWallet, EmbeddedTransaction, EmbeddedTransfer, EmbeddedAllocation, EmbeddedHold].each(&:reset_column_information)
     end
 
     def json_column_type(connection)
@@ -210,6 +227,32 @@ class EmbeddabilityTest < ActiveSupport::TestCase
       foreign_key: :transfer_id,
       inverse_of: :transfer,
       dependent: :nullify
+  end
+
+  # An embedded ledger that opts into holds, the way the plan's recipe says:
+  # its own hold class and table, its associations, and `hold_class_name`.
+  # It shares the embedded tables above; only its holds live apart.
+  class EmbeddedHoldingTransaction < EmbeddedTransaction
+    belongs_to :wallet, class_name: "EmbeddabilityTest::EmbeddedHoldingWallet", inverse_of: :transactions
+    has_many :holds, class_name: "EmbeddabilityTest::EmbeddedHold", foreign_key: :transaction_id, inverse_of: :credit
+  end
+
+  class EmbeddedHoldingWallet < EmbeddedWallet
+    self.transaction_class_name = "EmbeddabilityTest::EmbeddedHoldingTransaction"
+    self.hold_class_name = "EmbeddabilityTest::EmbeddedHold"
+    self.callback_event_map = callback_event_map.merge(hold_created: :embedded_hold_created, hold_released: :embedded_hold_released).freeze
+
+    has_many :transactions, class_name: "EmbeddabilityTest::EmbeddedHoldingTransaction", foreign_key: :wallet_id, inverse_of: :wallet
+    has_many :holds, class_name: "EmbeddabilityTest::EmbeddedHold", foreign_key: :wallet_id, inverse_of: :wallet
+  end
+
+  class EmbeddedHold < Wallets::HoldBase
+    self.embedded_table_name = "embedded_holds"
+    self.config_provider = -> { EmbeddabilityTest.embedded_config }
+
+    belongs_to :wallet, class_name: "EmbeddabilityTest::EmbeddedHoldingWallet", inverse_of: :holds
+    belongs_to :credit, class_name: "EmbeddabilityTest::EmbeddedHoldingTransaction", foreign_key: :transaction_id, inverse_of: :holds, optional: true
+    belongs_to :capture_transaction, class_name: "EmbeddabilityTest::EmbeddedHoldingTransaction", optional: true
   end
 
   ensure_embedded_tables!
@@ -389,6 +432,18 @@ class EmbeddabilityTest < ActiveSupport::TestCase
     assert_equal "Wallet classes must match", error.message
   end
 
+  test "a wallet of another ledger that shares this wallet's id is refused as another class" do
+    # Two ledgers keep separate tables, so their ids can coincide; the class
+    # check must come first or the twin reads as "the same wallet".
+    base_wallet = create_wallet(users(:rich_user), asset_code: :shared_asset, initial_balance: 100)
+    twin = EmbeddedWallet.create!(id: base_wallet.id, owner: users(:peer_user), asset_code: "shared_asset")
+
+    [[base_wallet, twin], [twin, base_wallet]].each do |sender, recipient|
+      error = assert_raises(Wallets::InvalidTransfer) { sender.transfer_to(recipient, 10, category: :peer_payment) }
+      assert_equal "Wallet classes must match", error.message
+    end
+  end
+
   test "credit accepts and persists extra transaction attributes on embedded subclasses" do
     wallet = EmbeddedWallet.create_for_owner!(owner: users(:new_user), asset_code: :extra_attrs, initial_balance: 0)
 
@@ -424,10 +479,279 @@ class EmbeddabilityTest < ActiveSupport::TestCase
     assert_equal "ORDER-42", transaction.source_reference
   end
 
+  # ───────────────────────────────────────────────────────────────────────────
+  # Holds are opt-in: this embedded ledger never enabled them
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "an embedded ledger keeps no holds unless it opts in" do
+    refute EmbeddedWallet.holds_enabled?
+    assert_nil EmbeddedWallet.hold_class_name
+    assert_raises(Wallets::HoldsNotEnabled) { EmbeddedWallet.hold_class }
+    refute EmbeddedTransaction.reflect_on_association(:holds), "hold associations belong to opted-in classes only"
+    refute EmbeddedWallet.reflect_on_association(:holds)
+  end
+
+  test "a ledger without holds never touches a holds table, destroy included" do
+    sender = EmbeddedWallet.create_for_owner!(owner: users(:rich_user), asset_code: :plain_points, initial_balance: 100)
+    recipient = EmbeddedWallet.create_for_owner!(owner: users(:peer_user), asset_code: :plain_points)
+    EmbeddabilityTest.embedded_config.allow_negative_balance = true
+
+    statements = capture_sql do
+      credit = sender.credit(50, category: :embedded_reward, expires_at: 10.days.from_now)
+      debit = sender.debit(30, category: :embedded_charge)
+      sender.transfer_to(recipient, 40, category: :peer_payment)
+      sender.debit(500, category: :embedded_charge)
+      EmbeddabilityTest.embedded_config.allow_negative_balance = false
+      assert_raises(Wallets::InsufficientBalance) { sender.debit(10, category: :embedded_charge) }
+
+      [sender, recipient].each do |wallet|
+        wallet.balance
+        wallet.available_balance
+        wallet.held_balance
+        wallet.total_balance
+        wallet.on_hold?
+        wallet.has_enough_balance?(1)
+      end
+      [credit, debit].each do |transaction|
+        transaction.held_amount
+        transaction.available_amount
+        transaction.held?
+      end
+
+      recipient.destroy!
+      sender.destroy!
+    end
+
+    assert statements.any? { |sql| sql.match?(/embedded_transactions/) }, "the capture saw the ledger's own queries"
+    hold_statements = statements.grep(/holds/i)
+    assert_empty hold_statements, "a ledger without holds ran hold SQL:\n#{hold_statements.join("\n")}"
+  end
+
+  test "a ledger without holds refuses every hold command before a single query" do
+    wallet = EmbeddedWallet.create_for_owner!(owner: users(:new_user), asset_code: :no_holds, initial_balance: 100)
+    recipient = EmbeddedWallet.create_for_owner!(owner: users(:peer_user), asset_code: :no_holds)
+    credit = wallet.transactions.sole
+    EmbeddedCallbacks.reset!
+    commands = {
+      "hold a credit" => -> { wallet.hold(credit, category: :review) },
+      "hold the wallet" => -> { wallet.hold(category: :review, until: 1.day.from_now) },
+      "reserve" => -> { wallet.reserve(10, category: :booking) },
+      "credit(hold:)" => -> { wallet.credit(10, category: :embedded_reward, hold: {category: :review}) },
+      "credit(available_at:) ahead" => -> { wallet.credit(10, category: :embedded_reward, available_at: 1.day.from_now) },
+      "credit(available_at:) already passed" => -> { wallet.credit(10, category: :embedded_reward, available_at: 1.day.ago) },
+      "debit(from:)" => -> { wallet.debit(10, category: :embedded_charge, from: credit) },
+      "debit(from: nil)" => -> { wallet.debit(10, category: :embedded_charge, from: nil) },
+      "transfer_to(from:)" => -> { wallet.transfer_to(recipient, 10, category: :peer_payment, from: [credit]) }
+    }
+
+    statements = capture_sql do
+      commands.each do |name, command|
+        error = assert_raises(Wallets::HoldsNotEnabled, "#{name} must be refused") { command.call }
+        assert_includes error.message, "EmbeddabilityTest::EmbeddedWallet does not keep holds"
+      end
+    end
+
+    assert_empty statements, "a refused hold command ran SQL:\n#{statements.join("\n")}"
+    assert_equal [100], wallet.transactions.pluck(:amount), "no credit was written"
+    assert_equal 100, wallet.reload.balance
+    assert_empty EmbeddedCallbacks.events
+  end
+
+  test "an embedded ledger that opts in keeps its holds in its own table, end to end" do
+    wallet = EmbeddedHoldingWallet.create_for_owner!(owner: users(:new_user), asset_code: :held_points)
+    held = wallet.credit(100, category: :embedded_reward)
+    free = wallet.credit(50, category: :embedded_reward, expires_at: 10.days.from_now)
+    EmbeddedCallbacks.reset!
+    hold = reservation = spend = arriving = nil
+
+    statements = capture_sql do
+      hold = wallet.hold(held, category: :fraud_review)
+      reservation = wallet.reserve(20, category: :booking)
+      spend = wallet.debit(30, category: :embedded_charge)
+      arriving = wallet.credit(5, category: :embedded_reward, hold: :pending_validation)
+    end
+
+    assert_instance_of EmbeddedHold, hold
+    assert_equal [held, wallet], [hold.credit, hold.wallet]
+    assert_equal [hold], held.holds.to_a
+    assert_equal [[free.id, 30]], spend.outgoing_allocations.pluck(:source_transaction_id, :amount), "FEFO skips the held credit"
+    assert_equal [100, 0, true], [held.held_amount, held.available_amount, held.held?]
+    assert_equal [0, 20, false], [free.held_amount, free.available_amount, free.held?]
+    assert_equal [0, 125, 125], [wallet.balance, wallet.held_balance, wallet.total_balance]
+    assert_equal 0, wallet.reload.read_attribute(:balance)
+    assert_equal %i[embedded_hold_created embedded_hold_created embedded_debited embedded_credited embedded_hold_created],
+      EmbeddedCallbacks.events.map { |event| event[:event] } - [:embedded_low_balance, :embedded_depleted]
+
+    hold_statements = statements.grep(/holds/i)
+    refute_empty hold_statements
+    assert hold_statements.all? { |sql| sql.include?("embedded_holds") }, "every hold query reads the embedded table"
+    assert statements.none? { |sql| sql.match?(/wallets_(holds|transactions|wallets|allocations)/) }, "the standalone ledger is never touched"
+
+    hold.release!(reason: "cleared")
+    reservation.release!
+    wallet.hold(category: :chargeback)
+    assert wallet.on_hold?
+    assert_equal [0, 125, 125], [wallet.balance, wallet.held_balance, wallet.total_balance]
+    assert_equal 1, arriving.holds.count
+  end
+
+  test "an embedded ledger that opts in captures reservations and cancels held credits in its own tables" do
+    wallet = EmbeddedHoldingWallet.create_for_owner!(owner: users(:new_user), asset_code: :held_points)
+    recipient = EmbeddedHoldingWallet.create_for_owner!(owner: users(:peer_user), asset_code: :held_points)
+    held = wallet.credit(100, category: :embedded_reward, hold: :fraud_review)
+    free = wallet.credit(50, category: :embedded_reward)
+    reservation = wallet.reserve(30, category: :booking)
+    EmbeddedCallbacks.reset!
+    debit = cancelled = transfer = nil
+
+    statements = capture_sql do
+      debit = reservation.capture!(20, category: :embedded_charge)
+      cancelled = wallet.debit(60, category: :embedded_charge, from: held)
+      transfer = wallet.transfer_to(recipient, 40, category: :peer_payment, from: [held])
+    end
+
+    assert_instance_of EmbeddedHoldingTransaction, debit
+    assert_equal debit, reservation.reload.capture_transaction
+    assert_equal [[free.id, 20]], debit.outgoing_allocations.pluck(:source_transaction_id, :amount)
+    assert_equal [[held.id, 60]], cancelled.outgoing_allocations.pluck(:source_transaction_id, :amount)
+    assert_equal [[held.id, 40]], transfer.outbound_transaction.outgoing_allocations.pluck(:source_transaction_id, :amount)
+    assert_equal [30, 0, 30], [wallet.balance, wallet.held_balance, wallet.total_balance]
+    assert_equal 40, recipient.balance
+    assert_equal %i[embedded_debited embedded_hold_released embedded_debited embedded_debited embedded_credited embedded_transfer_completed],
+      EmbeddedCallbacks.events.map { |event| event[:event] } - [:embedded_low_balance, :embedded_depleted]
+
+    assert statements.none? { |sql| sql.match?(/wallets_(holds|transactions|wallets|allocations|transfers)/) }, "the standalone ledger is never touched"
+  end
+
+  test "a ledger without holds on a wallet table that predates ledger_revision keeps working" do
+    # An embedder's 0.3-era schema has no ledger_revision. Every command still
+    # writes a strictly later updated_at, with update_column when the balance
+    # does not move, so even under no_touching and a frozen clock; a stale
+    # snapshot is told by updated_at and balance instead.
+    legacy = Class.new(EmbeddedWallet) do
+      def self.name
+        "EmbeddabilityTest::LegacySchemaWallet"
+      end
+
+      self.ignored_columns += ["ledger_revision"]
+
+      # usage_credits' floored policy: a debit from zero leaves zero.
+      def current_balance
+        [super, 0].max
+      end
+    end
+    EmbeddabilityTest.embedded_config.allow_negative_balance = true
+    freeze_time
+    wallet = legacy.create_for_owner!(owner: users(:new_user), asset_code: :legacy_schema, initial_balance: 10)
+    wallet.debit(10, category: :embedded_charge)
+    markers = [wallet.reload.updated_at]
+
+    ActiveRecord::Base.no_touching { wallet.debit(5, category: :embedded_charge) } # 0 stays 0: the marker alone
+    markers << wallet.reload.updated_at
+    wallet.debit(5, category: :embedded_charge)
+    markers << wallet.reload.updated_at
+
+    assert_equal [Rational(1, 1_000_000)] * 2, markers.each_cons(2).map { |earlier, later| later.to_r - earlier.to_r }, "a microsecond further each time"
+    assert_equal 0, wallet.read_attribute(:balance)
+    assert_equal 0, EmbeddedWallet.find(wallet.id).ledger_revision, "a ledger that cannot see the column never writes it"
+
+    legacy.stubs(:current_reads_need_locks?).returns(true)
+    legacy.transaction(requires_new: true) do
+      wallet.lock!
+      refute wallet.send(:stale_snapshot?)
+
+      wallet.updated_at += 1.second
+      assert wallet.send(:stale_snapshot?), "told by updated_at and balance"
+      raise ActiveRecord::Rollback
+    end
+  end
+
+  test "readers without holds delegate to the ledger's own balance policy" do
+    # usage_credits overrides `current_balance` (its refund debt stays
+    # ledger debt, its public balance is floored at zero). Without holds,
+    # available and total balance must be that very number.
+    floored = Class.new(EmbeddedWallet) do
+      def self.name
+        "EmbeddabilityTest::FlooredWallet"
+      end
+
+      def current_balance
+        [positive_remaining_balance - unbacked_negative_balance(transactions.debits.where(category: "embedded_charge")), 0].max
+      end
+    end
+    EmbeddabilityTest.embedded_config.allow_negative_balance = true
+    wallet = floored.create_for_owner!(owner: users(:new_user), asset_code: :floored, initial_balance: 10)
+    wallet.debit(25, category: :embedded_charge)
+
+    statements = capture_sql do
+      assert_equal 0, wallet.balance
+      assert_equal 0, wallet.available_balance
+      assert_equal 0, wallet.total_balance
+      assert_equal 0, wallet.held_balance
+      refute wallet.on_hold?
+    end
+
+    assert_empty statements.grep(/holds/i)
+    assert_equal 0, wallet.reload.read_attribute(:balance), "the override also decides the cached balance"
+  end
+
+  test "an embedder's 0.3 overrides of the balance helpers keep working, inside and outside a mutation" do
+    # D12: both helpers keep their 0.3 signatures, so an override written
+    # against 0.3, calling `super` with no arguments, still fits.
+    legacy_helpers = Module.new do
+      def positive_remaining_balance
+        super
+      end
+
+      def unbacked_negative_balance(transaction_scope = transactions.debits)
+        super
+      end
+    end
+    plain = Class.new(EmbeddedWallet) do
+      def self.name
+        "EmbeddabilityTest::LegacyHelpersWallet"
+      end
+    end
+    plain.prepend(legacy_helpers)
+    with_holds = Class.new(Wallets::Wallet) do
+      def self.name
+        "EmbeddabilityTest::LegacyHelpersWalletWithHolds"
+      end
+    end
+    with_holds.prepend(legacy_helpers)
+    EmbeddabilityTest.embedded_config.allow_negative_balance = true
+    Wallets.configuration.allow_negative_balance = true
+
+    [[plain, :embedded_charge], [with_holds, :purchase]].each do |ledger, charge|
+      sender = ledger.create_for_owner!(owner: users(:new_user), asset_code: :legacy, initial_balance: 100)
+      recipient = ledger.create_for_owner!(owner: users(:peer_user), asset_code: :legacy)
+
+      sender.debit(30, category: charge)
+      sender.transfer_to(recipient, 20, category: :peer_payment)
+      sender.debit(80, category: charge)
+
+      assert_equal(-30, sender.balance, ledger.name)
+      assert_equal(-30, sender.reload.read_attribute(:balance), ledger.name)
+      assert_equal [0, 30], [sender.send(:positive_remaining_balance), sender.send(:unbacked_negative_balance)], ledger.name
+      assert_equal 20, recipient.balance, ledger.name
+    end
+  end
+
+  test "insufficient_balance on a ledger without holds reports nothing held or reserved" do
+    wallet = EmbeddedWallet.create_for_owner!(owner: users(:new_user), asset_code: :short, initial_balance: 5)
+
+    error = assert_raises(Wallets::InsufficientBalance) { wallet.debit(10, category: :embedded_charge) }
+
+    assert_equal "Insufficient balance (5 < 10)", error.message
+    event = EmbeddedCallbacks.events.find { |entry| entry[:event] == :embedded_insufficient }
+    assert_equal 0, event[:data][:metadata][:held]
+    assert_equal 0, event[:data][:metadata][:reserved]
+  end
+
   private
 
   def cleanup_embedded_records!
-    [EmbeddedAllocation, EmbeddedTransaction, EmbeddedTransfer, EmbeddedWallet].each do |model|
+    [EmbeddedHold, EmbeddedAllocation, EmbeddedTransaction, EmbeddedTransfer, EmbeddedWallet].each do |model|
       next unless model.table_exists?
 
       model.delete_all

@@ -30,12 +30,12 @@ class Wallets::InstallGeneratorTest < Rails::Generators::TestCase
     end
   end
 
-  test "generated migration creates and drops all four tables against a real database" do
+  test "generated migration creates and drops all five tables against a real database" do
     run_generator
     migration_path = Dir.glob(File.join(destination_root, "db/migrate/*_create_wallets_tables.rb")).sole
 
     Wallets.configuration.table_prefix = "gencheck_"
-    tables = %w[gencheck_wallets gencheck_transfers gencheck_transactions gencheck_allocations]
+    tables = %w[gencheck_wallets gencheck_transfers gencheck_transactions gencheck_allocations gencheck_holds]
     connection = ActiveRecord::Base.connection
 
     begin
@@ -48,6 +48,8 @@ class Wallets::InstallGeneratorTest < Rails::Generators::TestCase
       ActiveRecord::Migration.suppress_messages do
         migration.migrate(:up)
         tables.each { |table| assert connection.data_source_exists?(table), "expected #{table} to be created" }
+        revision = connection.columns("gencheck_wallets").find { |column| column.name == "ledger_revision" }
+        assert_equal [:integer, false, "0"], [revision&.type, revision&.null, revision&.default.to_s], "a fresh install keeps a ledger revision"
         assert connection.indexes("gencheck_transactions").any?, "expected indexes on gencheck_transactions"
         assert connection.indexes("gencheck_transfers").any?, "expected indexes on gencheck_transfers"
         assert connection.check_constraint_exists?(
@@ -57,6 +59,21 @@ class Wallets::InstallGeneratorTest < Rails::Generators::TestCase
         assert connection.check_constraint_exists?(
           "gencheck_allocations",
           name: "check_gencheck_allocations_amount_positive"
+        )
+        %w[amount_positive credit_hold_has_no_amount capture_ends_reservation].each do |suffix|
+          assert connection.check_constraint_exists?("gencheck_holds", name: "check_gencheck_holds_#{suffix}"),
+            "expected the #{suffix} check on gencheck_holds"
+        end
+        assert_equal %w[gencheck_transactions gencheck_transactions gencheck_wallets],
+          connection.foreign_keys("gencheck_holds").map(&:to_table).sort
+        assert_equal(
+          %w[
+            index_gencheck_holds_on_capture_tx
+            index_gencheck_holds_on_releases_at
+            index_gencheck_holds_on_tx_and_released_at
+            index_gencheck_holds_on_wallet_and_released_at
+          ],
+          connection.indexes("gencheck_holds").map(&:name).sort
         )
 
         migration.migrate(:down)

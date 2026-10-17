@@ -8,6 +8,9 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
       t.references :owner, polymorphic: true, null: false, type: foreign_key_type
       t.string :asset_code, null: false
       t.bigint :balance, null: false, default: 0
+      # Incremented by every command, so a stale database snapshot can always
+      # be told from a current one, whatever the clock or a `touch` says.
+      t.bigint :ledger_revision, null: false, default: 0
       t.send(json_column_type, :metadata, null: false, default: json_column_default)
 
       t.timestamps
@@ -55,6 +58,50 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
       t.timestamps
     end
 
+    # Holds keep value in the ledger but out of the available balance: a hold
+    # on one credit, a hold on the whole wallet, or a reservation of an amount.
+    create_table holds_table, id: primary_key_type do |t|
+      t.references :wallet, null: false, type: foreign_key_type,
+                            foreign_key: { to_table: wallets_table },
+                            index: false
+
+      # The credit a credit hold covers. Wallet holds and reservations have none.
+      t.references :transaction, type: foreign_key_type,
+                                 foreign_key: { to_table: transactions_table },
+                                 index: false
+
+      # The debit a reservation was captured into.
+      t.references :capture_transaction, type: foreign_key_type,
+                                         foreign_key: { to_table: transactions_table },
+                                         index: { unique: true, name: index_name("holds_on_capture_tx") }
+
+      t.bigint :amount # reservations only
+      t.string :category, null: false
+      t.datetime :releases_at # the scheduled end
+      t.datetime :released_at # the explicit end: a release or a capture
+      t.string :release_reason
+      t.send(json_column_type, :metadata, null: false, default: json_column_default)
+      t.send(json_column_type, :release_metadata, null: false, default: json_column_default)
+
+      t.timestamps
+
+      # Ordinary composite indexes, which every adapter supports; correctness
+      # never depends on a partial index. They also serve the wallet_id and
+      # transaction_id foreign keys, and live inside the table so that MySQL
+      # can drop the table without first dropping an index a key still needs.
+      t.index [:wallet_id, :released_at], name: index_name("holds_on_wallet_and_released_at")
+      t.index [:transaction_id, :released_at], name: index_name("holds_on_tx_and_released_at")
+      t.index :releases_at, name: index_name("holds_on_releases_at")
+
+      t.check_constraint "amount IS NULL OR amount > 0", name: constraint_name("holds_amount_positive")
+      # A credit hold holds the credit's whole remaining value, never an amount.
+      t.check_constraint "transaction_id IS NULL OR amount IS NULL", name: constraint_name("holds_credit_hold_has_no_amount")
+      # Only an ended reservation can name the debit it was captured into.
+      t.check_constraint "capture_transaction_id IS NULL OR " \
+                         "(transaction_id IS NULL AND amount IS NOT NULL AND released_at IS NOT NULL)",
+                         name: constraint_name("holds_capture_ends_reservation")
+    end
+
     add_check_constraint transfers_table,
                          "amount > 0",
                          name: constraint_name("transfers_amount_positive")
@@ -93,9 +140,10 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
   end
 
   # MySQL does not allow defaults on JSON columns, so models treat nil metadata
-  # the same as an empty hash when records are loaded.
+  # the same as an empty hash when records are loaded. Rails' Trilogy adapter
+  # talks to MySQL too, under its own name.
   def json_column_default
-    return nil if connection.adapter_name.downcase.include?("mysql")
+    return nil if connection.adapter_name.match?(/mysql|trilogy/i)
 
     {}
   end
@@ -118,6 +166,10 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
 
   def transfers_table
     "#{table_prefix}transfers"
+  end
+
+  def holds_table
+    "#{table_prefix}holds"
   end
 
   def index_name(suffix)

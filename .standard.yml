@@ -3,3 +3,6 @@ ruby_version: 3.1
 ignore:
   - test/dummy/bin/**/*
   - test/dummy/db/*_schema.rb
+  # The upgrade generator's template, rendered verbatim (a test keeps the two
+  # identical), so it keeps the templates' house style.
+  - test/dummy/db/migrate/*_add_wallets_holds.rb

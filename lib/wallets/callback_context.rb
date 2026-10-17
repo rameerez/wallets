@@ -15,6 +15,7 @@ module Wallets
     :category,
     :transaction,
     :metadata,
+    :hold,
     keyword_init: true
   ) do
     def owner

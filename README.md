@@ -52,6 +52,7 @@ user.wallet(:mb).balance  # => 6656 MB remaining
 | **Multi-asset** | One wallet per asset: `user.wallet(:usd)`, `user.wallet(:gems)` |
 | **Append-oriented ledger API** | Every balance change made through the wallet API creates a transaction row |
 | **Expiration-aware allocation** | Debits consume soonest-expiring credits first, then the oldest bucket |
+| **Holds and reservations** | Keep value pending or set aside: `balance` is what can be spent, `held_balance` what is held |
 | **Linked transfers** | Both sides of a transfer are recorded and queryable |
 | **Row-level locking** | Prevents race conditions and double-spending |
 | **Balance snapshots** | Each transaction records before/after balance for reconciliation |
@@ -251,7 +252,7 @@ Transfers require both wallets to use the same asset and the same wallet class. 
 
 By default `wallets` rejects any debit or transfer that would push a wallet below zero. Some apps (ride-fare apps with rewards, family wallets with shared spend, telecom plans with bridging credit, etc.) want to allow a small overdraft so the user experience doesn't hard-stop on a low balance.
 
-Flip one flag and it applies consistently to direct `wallet.debit` and to `wallet.transfer_to`:
+Flip one flag and it applies consistently to `wallet.debit`, `wallet.transfer_to`, `wallet.reserve` and `reservation.capture!`:
 
 ```ruby
 Wallets.configure do |config|
@@ -269,13 +270,13 @@ A few things to know:
 - **Apps own the floor.** The flag is binary — it doesn't cap how negative a wallet can go. If you want a "5€ convenience overdraft", enforce that in your domain code before calling `transfer_to` (e.g. a `WalletPolicy.can_afford?(wallet:, amount:)` service that checks `wallet.balance + MAX_OVERDRAFT >= amount`).
 - **`has_enough_balance?` stays strict.** It answers "does this wallet have enough on hand right now?" — overdraft is a deliberate choice the caller makes by attempting the debit/transfer, not by querying. So `wallet.has_enough_balance?(amount)` returns `false` even when the gem would happily complete an overdraft.
 - **`:preserve` expiration falls back to `:none` when a transfer goes negative.** With `allow_negative_balance = true` and the default `:preserve` policy, transfers that exceed the source's positive buckets can't honestly "preserve" an expiration on the deficit portion (there is no source bucket). The transfer's `expiration_policy` is automatically downgraded to `:none` for that transfer; the receiver gets a single evergreen credit. Explicit `:fixed` (with `expires_at:`) and `:none` are honored as-is.
-- **`:balance_depleted` fires on positive→non-positive crossings**, not on exact zero. A debit that takes a wallet from +100 to -50 in one shot still fires the callback. With `allow_negative_balance = false` the behavior collapses back to "exactly zero" (since balances can't go below zero), so existing callers don't see a change.
+- **`:balance_depleted` fires on positive→non-positive crossings**, not on exact zero. A debit that takes a wallet from +100 to -50 in one shot still fires the callback. With `allow_negative_balance = false` a debit stops at exactly zero, but a hold over value that is also reserved can still take the available balance below it (see [Holds and reservations](#holds-and-reservations)), and the callback fires the same way.
 - **`:low_balance_reached` is one-shot per crossing**, regardless of how deep the dip goes. Going from +200 to -100 fires once; the next debit from -100 to -200 does not re-fire because the wallet was already below threshold.
-- **`:insufficient_balance` callback.** Fires only when a debit or transfer is actually rejected (i.e. flag off or your service-layer floor refused). Successful overdraft transfers do not fire it.
+- **`:insufficient_balance` callback.** Fires only when a debit, transfer, reservation or capture is actually rejected (i.e. flag off or your service-layer floor refused). Successful overdraft transfers do not fire it.
 - **Credits don't auto-settle prior debt.** If a wallet is at -50 and you `credit(80)`, the wallet's balance becomes 30 — but the unbacked -50 debit and the +80 credit persist as independent ledger rows. The next debit consumes from the +80 bucket without back-filling the older unbacked debit. The math is consistent; the audit story is "we never settled the original debt with this credit". If you want auto-settlement, do it in your service layer (e.g. when crediting, `wallet.transactions.where("amount < 0").where("ABS(amount) > spent_amount") …` and create allocations explicitly).
 - **System-initiated reversals.** Refunds and payout reversals via `transfer_to` will also go through, even if the recipient's wallet ends up below zero. That's correct: the ledger has to settle, and a negative wallet records a real debt instead of a silent failure. Apps that want to *block* user-initiated overdrafts but *allow* system reversals should keep the floor check in their service layer, not toggle the flag mid-request.
-- **Don't toggle the flag at runtime while wallets are negative.** `allow_negative_balance` is meant to be a stable config decision. The model carries a `balance >= 0` validation gated on the flag; flipping it OFF while wallets sit below zero leaves them un-saveable until you flip it back on (any subsequent `credit` / `debit` calls `refresh_cached_balance!`, which raises a `RecordInvalid`). If you need to turn the flag off, drain or settle any negative wallets first.
-- **Concurrency holds.** `wallet.debit` / `wallet.credit` use `with_lock` (row-level `SELECT … FOR UPDATE`); `wallet.transfer_to` locks both wallets in id order via `lock_wallet_pair!`. Two concurrent overdraft debits on the same wallet serialize cleanly — they don't double-count `previous_balance`.
+- **The flag decides what commands may do, not what the balance may read.** With it off, no command may spend beyond the available balance. Yet the available balance can still read negative: when a hold covers value that is also reserved, or when reserved value expires (see [Holds and reservations](#holds-and-reservations)). Such a wallet stays saveable, takes credits and releases, and refuses new spending until it is back in funds. So turning the flag off while some wallets are negative is safe: they keep their debt and stop going deeper.
+- **Concurrent writes serialize.** `wallet.debit` / `wallet.credit` use `with_lock` (row-level `SELECT … FOR UPDATE`); `wallet.transfer_to` locks both wallets in id order via `lock_wallet_pair!`. Two concurrent overdraft debits on the same wallet serialize cleanly — they don't double-count `previous_balance`.
 
 ### Expiring balances
 
@@ -289,7 +290,332 @@ user.wallet(:coins).credit(
 )
 ```
 
-Debits allocate against the oldest available, non-expired credits first.
+Debits consume the soonest-expiring credits first, then the oldest. Expired value is never spent, and neither is held value (see [Holds and reservations](#holds-and-reservations)).
+
+## Holds and reservations
+
+Sometimes value is in a wallet but must not be spent yet. A reward waits for validation. A seller's earnings wait out the return window. A booking sets money aside until the service is delivered. A fraud review freezes one credit, or the whole wallet. `wallets` models all of these with **holds**, and reads them the way your bank statement does:
+
+| On your bank statement | In `wallets` |
+|---|---|
+| A deposit that has not cleared | A credit under a **hold** (on that credit, or on the whole wallet) |
+| A card charge that stays pending until the merchant captures it | A **reservation** of an amount, later **captured** or released |
+| Available balance | `wallet.balance` (also `wallet.available_balance`) |
+| Pending | `wallet.held_balance` |
+| Current balance | `wallet.total_balance` |
+
+`balance` is always what can be spent right now. Held value is left out of it, exactly the way expired value already is, and `total_balance` is always `balance + held_balance`. If you never place a hold, nothing changes: `held_balance` is `0` and `total_balance` equals `balance`.
+
+There is one honest difference from a bank. Value in `wallets` can expire, and a hold never stops that clock. So a capture still needs funding at the moment it happens.
+
+Hold categories are free-form labels such as `:fraud_review` or `:pending_validation`, and need no configuration. The debit categories in these examples (`:reversal`, `:booking_charge`) are ordinary transaction categories, so add them to `config.additional_categories`.
+
+### Pending value you received
+
+Credit the value now and let it become spendable later:
+
+```ruby
+credit = wallet.credit(751, category: :reward, hold: :pending_validation)
+
+wallet.balance        # => 0
+wallet.held_balance   # => 751
+wallet.total_balance  # => 751
+
+credit.held?                          # => true
+credit.holds.active.map(&:category)   # => ["pending_validation"]
+```
+
+The credit and its hold are written in one step, so the value is never spendable in between, not even in a callback or a balance snapshot.
+
+Pass a Hash to give the hold a deadline and its own metadata. When the deadline arrives, the value becomes available on its own:
+
+```ruby
+wallet.credit(751, category: :reward, metadata: { ride_id: 7 },
+  hold: { category: :pending_validation, until: 3.months.from_now, metadata: { case_id: 42 } })
+```
+
+Or just say when the value becomes available. `available_at:` is shorthand for a hold of category `:pending` until that time:
+
+```ruby
+wallet.credit(500, category: :reward, available_at: 14.days.from_now)   # a referral bonus that unlocks in 14 days
+```
+
+A time that has already passed means available now, with no hold at all. Pass `hold:` or `available_at:`, not both.
+
+### Holding value that already landed
+
+Hold a credit that is already in the wallet:
+
+```ruby
+hold = wallet.hold(credit, category: :fraud_review, metadata: { case_id: 42 })
+```
+
+A credit hold always holds the credit's whole remaining value. One credit can be held for several reasons at once. Each hold is an independent reason, released on its own, and the credit stays held while any of them is active. Its value is still counted once:
+
+```ruby
+fraud   = wallet.hold(credit, category: :fraud_review)
+dispute = wallet.hold(credit, category: :dispute, until: 30.days.from_now)
+
+fraud.release!
+credit.held?   # => true, the dispute still holds it
+
+dispute.release!
+credit.held?   # => false
+```
+
+Leave the credit out to hold the whole wallet. Every credit is held, including credits that arrive later:
+
+```ruby
+wallet.hold(category: :chargeback, metadata: { case_id: 7 })
+
+wallet.on_hold?                              # => true
+wallet.balance                               # => 0
+wallet.credit(40, category: :reward).held?   # => true
+```
+
+Only leaving the credit out holds the whole wallet. Passing `nil` raises `ArgumentError`, so a lookup that found nothing can never freeze a wallet by accident. `on_hold?` is true only for a hold on the whole wallet: a held credit or a pending reservation does not count.
+
+Release a hold to make its value available again. Why it ended is recorded next to why it began, never over it:
+
+```ruby
+hold.release!(reason: "cleared_by_operator", metadata: { actor_id: 12 })
+
+hold.released?        # => true
+hold.release_reason   # => "cleared_by_operator"
+hold.release_metadata # => { "actor_id" => 12 }
+hold.metadata         # => { "case_id" => 42 }
+```
+
+`release!` is idempotent. On a hold that has already ended (released, captured, or past its deadline) it changes nothing and reports nothing.
+
+There is no `release_all`, on purpose: an operator clears the exact holds they reviewed, never "everything in a category". To release a set together, release each one inside one wallet lock:
+
+```ruby
+wallet.with_lock do
+  reviewed_holds.each { |hold| hold.release!(reason: "cleared_by_operator") }
+end
+```
+
+To find holds:
+
+```ruby
+wallet.holds.active                # every hold in force right now
+wallet.holds.coverage.active       # holds on credits and on the whole wallet
+wallet.holds.reservations.active   # pending reservations
+credit.holds.active                # the reasons this credit is held
+```
+
+The `Wallets::Hold` scopes are `active` (which takes `at:`), `released`, `coverage`, `reservations`, `wallet_scoped` and `credit_scoped`. Each hold answers `active?`, `released?`, `lapsed?` (its deadline passed without a release), `captured?`, `reservation?`, `coverage?`, `wallet_scoped?` and `credit_scoped?`. A credit hold reaches its credit through `hold.credit`. The column is `transaction_id`, but Active Record reserves the name `transaction`, so there is no `hold.transaction`. Each credit answers `held?`, `held_amount` and `available_amount`.
+
+### Reserving value you are about to charge
+
+A reservation sets an amount aside, like a card charge that stays pending until the merchant captures it:
+
+```ruby
+wallet.balance   # => 10000
+
+reservation = wallet.reserve(3_000, category: :booking, until: 7.days.from_now, metadata: { booking_id: 42 })
+
+wallet.balance        # => 7000
+wallet.held_balance   # => 3000
+```
+
+When the service is delivered, capture what it really cost. The rest of the reservation is released in the same step:
+
+```ruby
+debit = reservation.capture!(2_750, category: :booking_charge, metadata: { booking_id: 42 })
+
+wallet.balance                    # => 7250
+reservation.captured?             # => true
+reservation.capture_transaction   # => debit
+```
+
+Leave the amount out to capture the whole reservation. If the booking is cancelled, `reservation.release!` gives the amount back. If the deadline passes first, the reservation lapses and its amount is available again.
+
+Reservations add up, like two pending card charges:
+
+```ruby
+wallet.reserve(40, category: :booking)
+wallet.reserve(40, category: :booking)
+
+wallet.held_balance   # => 80
+```
+
+The rules:
+
+- **A reservation is funded like a debit.** It must fit in `balance`, or it raises `Wallets::InsufficientBalance`, unless `allow_negative_balance` is on. The amount is parsed exactly like a debit's, and `until:` must be a time: anything else raises `ArgumentError` instead of quietly meaning "no deadline".
+- **A capture happens once.** Only an active reservation can be captured. A second capture, or a capture after a release or a lapse, raises `Wallets::InvalidHold` and creates nothing, so a retried request never charges twice. Capturing more than was reserved raises `ArgumentError`. The reservation's state is checked before the amount, so retrying a finished capture always raises `Wallets::InvalidHold`.
+- **A capture is funded when it happens.** It spends credits like any debit, with its own reservation counted back in. Held value is never captured, so a fraud hold placed after the reservation can make the capture fail with `Wallets::InsufficientBalance`, and so can expiry. A failed capture leaves the reservation as it was, ready to try again.
+- **A capture is one step.** Its balance snapshots and callbacks see the balance before and after the whole step, never the moment in between. Capturing the whole reservation of a fully reserved wallet reports an available balance of `0` before and `0` after. A capture never lowers the available balance: it takes at most what the reservation already kept out of it.
+
+### Ending a hold by taking the value
+
+Releasing a hold gives the value back. Sometimes the answer is the opposite: the reward was rejected, or the payment behind it bounced, and the value has to go. Name the credits to take it from with `from:`.
+
+> [!WARNING]
+> **`from:` is the one way to spend held value.** A plain `debit` or `transfer_to` never touches it. Reach for `from:` only when taking held value is exactly what you mean, such as cancelling a rejected reward.
+
+```ruby
+credit = wallet.credit(751, category: :reward, hold: :pending_validation)
+
+# The reward was rejected: take it back...
+wallet.debit(751, category: :reversal, from: credit, metadata: { reason: "reward_rejected" })
+
+# ...or move it to the platform instead.
+wallet.transfer_to(platform_wallet, 751, category: :reversal, from: credit)
+```
+
+Name several credits as a list, or pass any relation. They are spent in the order given, and a credit with nothing left simply gives nothing:
+
+```ruby
+wallet.debit(150, category: :reversal, from: [first_credit, second_credit])
+```
+
+How a debit with `from:` is funded:
+
+- **It takes from the named credits only, in full or not at all.** It never falls back to other credits and never leaves debt, whatever `allow_negative_balance` says. Asking for more than the named credits hold raises `Wallets::InsufficientBalance`.
+- **Held value needs no funding.** It was never part of the available balance, so cancelling a fully held credit works even when nothing is available.
+- **Unheld value does.** With overdrafts off, the part taken from unheld credits must fit in the available balance. So naming an unheld credit cannot spend what a reservation set aside, or deepen a deficit.
+- **Only saved credits of this wallet.** Every other source is a wrong argument and raises `ArgumentError` before anything is written: an empty list, a credit named twice, a debit, an unsaved or deleted credit, another wallet's credit or another ledger's, and `from: nil` (leave `from:` out to spend as usual). An expired credit is not an error: like a spent one it simply has nothing left to give, so it is passed over and never allocated from (no value is ever created from an expired bucket, under any expiration policy), and if the named credits then fall short the debit raises `Wallets::InsufficientBalance`.
+- **The holds stay where they are.** The credit keeps its reasons, with nothing left to hold. No `on_hold_released` fires, because nothing was released.
+- **A transfer with `from:` always keeps its sources' expirations** under the default `:preserve` policy. It is always fully backed by the named credits, even when the value was held and nothing was available.
+
+### How holds change the rules you already know
+
+- **Holds decide which credits can fund a debit, and `allow_negative_balance` decides whether a debit nothing funds may go ahead.** An ordinary debit, transfer or capture skips held credits. With overdrafts on, whatever unheld credits cannot cover becomes debt, and held value is still never touched.
+- **A hold is not a ban.** It keeps value from being spent. It does not stop the wallet from receiving credits, and it does not stop your app from doing anything. If an action must be blocked during a review, such as a withdrawal, check for that in your app and show the hold as the reason.
+- **The available balance is a signed integer, and it can go negative without any overdraft.** Reserve 80 of 100, then hold the credit for fraud review:
+
+  ```ruby
+  wallet.reserve(80, category: :booking)
+  wallet.hold(credit, category: :fraud_review)
+
+  wallet.balance         # => -80
+  wallet.held_balance    # => 180
+  wallet.total_balance   # => 100
+  ```
+
+  Reserved value that expires has the same effect. With `allow_negative_balance` off, such a wallet stays perfectly usable: credits and releases work, and new spending is refused until the balance covers it. The flag decides what commands may do, not what the balance may read.
+- **`held_balance` can be larger than `total_balance`.** It happens above, where a hold covers value that is also reserved, and when reserved value expires. It is deliberately not capped, and `total_balance == balance + held_balance` still applies.
+- **A hold never pauses expiry.** A held credit that expires is gone, not held: its `held_amount` drops to `0`, while the hold stays readable as the reason it was held.
+- **Deadlines are computed, never announced.** When an `until:` passes, the hold simply stops counting (`lapsed?`), exactly like an expired credit. No job runs and no callback fires: `on_hold_released` fires only for `release!` and for a capture.
+- **The `:preserve` fallback follows what is really unbacked.** A transfer falls back to a single evergreen credit (`:none`) only when part of it is actually unbacked debt, not whenever it exceeds the available balance. This changes one case even without holds: with old debt and fresh expiring credits, a transfer above the net available balance that those credits fully cover now keeps their expiration instead of arriving evergreen.
+- **`insufficient_balance` says what is out of reach.** Its metadata gains `held:` (credit value under holds) and `reserved:` (active reservations), so `available + held + reserved` is the total balance. Both are `0` when nothing is held. The error message names the ones that are not zero: `Insufficient balance (20 < 40; 100 held, 30 reserved)`. A debit with `from:` adds `covered_consumed:` (the held value it would have taken), and a capture adds `available_for_capture:`. Their messages say what was compared, such as `(100 < 101 in the named credits; ...)`, `(10 < 61 - 50 from held credits; ...)` or `(0 < 80 to capture reservation 5; ...)`.
+- **Every change bumps the wallet's `ledger_revision`.** Each command that records something increments it, even when the available balance does not move, as with a second reason on a held credit or a whole capture. It is how a stale MySQL snapshot is told from a current one, and unlike a timestamp, no clock, `no_touching` or `touch` can repeat it. `updated_at` follows ordinary Rails rules. Read a new value of neither as "the balance changed".
+- **The cached `balance` column stores the available balance.** As before, it can go stale through time alone (expiry, and now deadlines), so call `wallet.balance` when the number matters.
+
+### Hold callbacks
+
+```ruby
+Wallets.configure do |config|
+  config.on_hold_created do |ctx|
+    Rails.logger.info("[Wallets] #{ctx.category} hold on wallet #{ctx.wallet.id}, available #{ctx.previous_balance} -> #{ctx.new_balance}")
+  end
+
+  config.on_hold_released do |ctx|
+    if ctx.transaction
+      Rails.logger.info("[Wallets] Reservation #{ctx.hold.id} captured as transaction #{ctx.transaction.id}")
+    else
+      Rails.logger.info("[Wallets] Hold #{ctx.hold.id} released: #{ctx.hold.release_reason}")
+    end
+  end
+end
+```
+
+On both events:
+
+- `ctx.hold` is the `Wallets::Hold`, and `ctx.category` is its category.
+- `ctx.amount` is a reservation's amount, and `nil` for a hold on a credit or a wallet. On a capture it is still the reserved amount: the debit carries what was captured.
+- `ctx.previous_balance` and `ctx.new_balance` are available balances.
+- `ctx.metadata` is the creation metadata on `on_hold_created` and the release metadata on `on_hold_released`. A capture's metadata lives on its debit.
+- `ctx.transaction` is set only when a capture ended the reservation, and it is the debit.
+
+What each command reports:
+
+| Command | Callbacks |
+|---|---|
+| `credit(..., hold:)` | `on_balance_credited`, then `on_hold_created` |
+| `hold`, `reserve` | `on_hold_created` |
+| `release!` | `on_hold_released`, or nothing when the hold had already ended |
+| `capture!` | `on_balance_debited`, then `on_hold_released` |
+| `debit(..., from:)` | `on_balance_debited` only: nothing is released |
+| A deadline passing | Nothing |
+
+A hold, a reservation or a debit that lowers the available balance can also fire `on_low_balance_reached` and `on_balance_depleted`, once per real crossing. A credit, a release and a deadline never do. Like every success callback, these run when the command's transaction commits, which is the outermost commit unless a `transaction(joinable: false)` boundary intervenes: inside one, Active Record's own `after_commit` rule applies, and they fire when the command's own transaction completes. A command that failed reports nothing.
+
+### Upgrading an existing install
+
+```bash
+bundle update wallets
+rails generate wallets:upgrade
+rails db:migrate
+```
+
+> **Migrate before the 0.4.0 code serves traffic.** The new code expects the holds table and the wallets' `ledger_revision` column. Until `rails db:migrate` has added them, reading a `Wallets::Wallet`'s balance, or running any command on it (an initial balance included), raises: a ledger that keeps holds fails loudly on purpose rather than treat held value as spendable. Deploy the migration first, then the code.
+
+The upgrade generator writes one migration that adds the holds table, and a `ledger_revision` column on the wallets table, to a 0.1, 0.2 or 0.3 install. It follows your `table_prefix`, and reads the key types from the tables you already have, uuid and unsigned keys included. Running it again never writes a second migration, and it writes none at all when both already exist. Rolling the migration back removes them only while the holds table is empty. Fresh installs get both from `rails generate wallets:install`.
+
+Then look at where your app reads `wallet.balance`. It still means "what can be spent", so spending checks need no change. Screens and reports that mean "everything the user has", such as a total earned or a reconciliation against the cached column, should read `total_balance`.
+
+### Embedding holds in your own ledger
+
+Holds are opt-in per ledger. `Wallets::Wallet` keeps them. `Wallets::WalletBase`, the class embedding gems subclass, does not, until your subclass sets `hold_class_name`. A ledger that has not opted in never touches holds:
+
+- `balance` runs the 0.3 math through the two helpers you may override, `positive_remaining_balance` and `unbacked_negative_balance(scope)`, which keep their signatures and their meaning. No hold SQL runs anywhere, destroy included.
+- `held_balance` is `0`, `on_hold?` is `false`, and `available_balance` and `total_balance` both equal your `balance`, whatever your `current_balance` override returns.
+- `hold`, `reserve`, `credit(hold:)`, `credit(available_at:)` and `from:` raise `Wallets::HoldsNotEnabled` before running a single query.
+
+To opt in, give your ledger its own hold class and table, declare the associations, and set `hold_class_name`:
+
+```ruby
+class MyGem::Hold < Wallets::HoldBase
+  self.embedded_table_name = "my_gem_holds"
+  self.config_provider = -> { MyGem.configuration }
+
+  belongs_to :wallet, class_name: "MyGem::Wallet", inverse_of: :holds
+  belongs_to :credit, class_name: "MyGem::Transaction", foreign_key: :transaction_id, inverse_of: :holds, optional: true
+  belongs_to :capture_transaction, class_name: "MyGem::Transaction", optional: true
+end
+
+class MyGem::Transaction < Wallets::TransactionBase
+  has_many :holds, class_name: "MyGem::Hold", foreign_key: :transaction_id, inverse_of: :credit
+end
+
+class MyGem::Wallet < Wallets::WalletBase
+  self.hold_class_name = "MyGem::Hold"
+  self.callback_event_map = callback_event_map.merge(hold_created: :coins_held, hold_released: :coins_released).freeze
+
+  has_many :holds, class_name: "MyGem::Hold", foreign_key: :wallet_id, inverse_of: :wallet
+end
+```
+
+- Create the table with the same columns, check constraints and indexes as `wallets_holds`. The install template has them.
+- Add `ledger_revision` to your wallets table, which is one `add_column :my_gem_wallets, :ledger_revision, :bigint, null: false, default: 0`. It is the robust marker for telling a stale MySQL snapshot from a current one, and a ledger that keeps holds refuses to run without it. A ledger without holds whose table lacks it still works, on a strictly increasing `updated_at` compared with `balance`, but another connection's `touch(time:)` can spoof that.
+- If your wallets can be destroyed, destroy their holds first. `Wallets::Wallet` does it in a `before_destroy` callback declared with `prepend: true`, so the holds go before the transactions they point at.
+- If you override `current_balance`, decide on purpose how it treats held and reserved value. With holds on, `balance`, `held_balance` and `total_balance` come from one set of terms. Overriding `current_balance` alone can break `total_balance == balance + held_balance`, so keep all three coherent.
+- `credit` now takes the keywords `hold:` and `available_at:`, and `debit` takes `from:`. If your transaction table has columns by those names, you can no longer pass them through `credit` or `debit` as extra attributes.
+
+### Performance and concurrency
+
+With holds on, `balance`, `held_balance` and `total_balance` are each one SQL statement: the same sums over the wallet's transactions as before, plus an indexed `EXISTS` lookup on the holds table for each credit and one sum over the active reservations. Without holds, reading a balance runs exactly the 0.3 queries.
+
+On MySQL, a transaction's snapshot is fixed by its first read (repeatable read). If your code reads something and then calls a wallet command in the same transaction, a plain read taken after the wallet lock could miss what another transaction just committed to that wallet. So each command compares the wallet's `ledger_revision`, which every command increments, as its snapshot shows it with the one the lock returns. When they differ, that command's ledger reads become locking reads, which always see the latest rows, and so do the reads of every later command in the same transaction, until that transaction commits or rolls back. A wallet your own code saved or touched earlier in the transaction counts as stale too, because its snapshot would otherwise look current. Locking reads are not used every time, because InnoDB's gap locks would then make unrelated wallets deadlock each other. PostgreSQL and SQLite always read the latest rows and never need this. It relies on every ledger change going through the wallet API, which increments the revision each time: raw SQL writes to the wallet row (`update_columns` included), and holds written as `Wallets::Hold` rows instead of through `hold`, `reserve` and `credit(hold:)`, are outside the supported API. The full reasoning is in [the 0.4 plan](docs/plans/2026-10-17-holds-and-reservations.md#6-operations).
+
+### Not in this release
+
+- **Partial holds on a credit.** A credit hold always holds the credit's whole remaining value. To set an amount aside, reserve it.
+- **Holds on incoming transfers.** `transfer_to` cannot yet issue the recipient's credits under an atomic initial hold. The recipient side can hold them with `wallet.hold(credit, ...)` after the transfer, but that second step is not atomic with it:
+
+  ```ruby
+  transfer = buyer_wallet.transfer_to(seller_wallet, 5_000, category: :sale)
+
+  transfer.inbound_transactions.each do |credit|
+    seller_wallet.hold(credit, category: :return_window, until: 14.days.from_now)
+  end
+  ```
+
+- **Deadline notifications.** Nothing fires when an `until:` passes. Schedule your own job if you need to act at that moment.
+- **Bucket pinning.** A reservation is an amount of the wallet, not a claim on particular credits. Ordinary debits leave it backed by the longest-lived credits, but expiry can still leave it underfunded.
 
 ## Configuration
 
@@ -318,7 +644,7 @@ end
 
 `wallets` ships with lifecycle callbacks you can use for notifications, analytics, or product logic.
 
-Successful callbacks run after the outermost database transaction commits. If a caller wraps a wallet operation in a larger transaction and later rolls it back, no success callback is emitted. Callback exceptions are logged and isolated from the already-committed ledger write. `on_insufficient_balance` remains immediate because it describes a rejected operation rather than a committed row.
+Successful callbacks run when the command's transaction commits, which is the outermost database transaction's commit unless a `transaction(joinable: false)` boundary intervenes (inside one, as with Active Record's own `after_commit`, they fire when the command's own transaction completes). If a caller wraps a wallet operation in a larger transaction and later rolls it back, no success callback is emitted, and a command that fails emits none even when the caller rescues the error and commits. Callback exceptions are logged and isolated from the already-committed ledger write. `on_insufficient_balance` remains immediate because it describes a rejected operation rather than a committed row.
 
 ```ruby
 Wallets.configure do |config|
@@ -352,6 +678,7 @@ Useful fields on `ctx` include:
 - `ctx.previous_balance`
 - `ctx.new_balance`
 - `ctx.transaction`
+- `ctx.hold` (hold events, see [Hold callbacks](#hold-callbacks))
 - `ctx.category`
 - `ctx.metadata`
 
@@ -757,7 +1084,6 @@ See [usage_credits](https://github.com/rameerez/usage_credits) — it uses `wall
 
 - **Banking infrastructure** — transfers to/from bank rails, cards, ACH, SEPA
 - **Regulated stored-value** — KYC, AML, licensing, custody requirements
-- **Escrow systems** — pending, available, reserved, delayed-release states
 - **FX conversion** — multi-currency conversion with exchange rates
 - **Full accounting** — charts of accounts, journal entries, financial reporting
 - **Blockchain/crypto** — consensus, custody, cryptographic guarantees
@@ -790,7 +1116,7 @@ The wallet API is append-oriented, but the gem does not turn Active Record or yo
 
 ## Can it support payments between users?
 
-Yes. `transfer_to` lets you move value between users while keeping both sides of the movement linked in the ledger. That makes it suitable for peer payments, marketplace payouts, seller balances, rewards, and in-game trades inside your own app.
+Yes. `transfer_to` lets you move value between users while keeping both sides of the movement linked in the ledger. That makes it suitable for peer payments, marketplace payouts, seller balances, rewards, and in-game trades inside your own app. It can also keep value pending, such as a seller's earnings until the return window closes, or set an amount aside until a charge is captured (see [Holds and reservations](#holds-and-reservations)).
 
 But it is not a blockchain and not a full payments stack.
 
@@ -798,7 +1124,6 @@ What it does not do for you:
 
 - external settlement to banks or cards
 - KYC/AML/compliance
-- escrow, reserves, or held balances
 - FX conversion between assets
 - disputes, chargebacks, or processor reconciliation
 - cryptographic consensus or custody guarantees
@@ -810,7 +1135,7 @@ So the right framing is: strong internal wallet/accounting primitive, not money 
 `wallets` is built to be embeddable: other gems can reuse the ledger core (expiration-aware allocation, locking, transfers, callbacks) on top of their **own** tables, config, and event names. This is exactly how [`usage_credits`](https://github.com/rameerez/usage_credits) works — its `UsageCredits::Wallet` is a `Wallets::WalletBase` subclass living in `usage_credits_*` tables.
 
 > [!IMPORTANT]
-> **Subclass the abstract `*Base` classes** (`Wallets::WalletBase`, `Wallets::TransactionBase`, `Wallets::AllocationBase`, `Wallets::TransferBase`) — **not** the concrete `Wallets::Wallet` etc. ActiveRecord builds a subclass's attribute methods on its parent's, so subclassing a concrete model forces a schema load of the `wallets_*` tables — which don't exist in apps that only install your gem. The abstract parents make each embedded model its own `base_class`, so the base tables are never consulted.
+> **Subclass the abstract `*Base` classes** (`Wallets::WalletBase`, `Wallets::TransactionBase`, `Wallets::AllocationBase`, `Wallets::TransferBase`, `Wallets::HoldBase`) — **not** the concrete `Wallets::Wallet` etc. ActiveRecord builds a subclass's attribute methods on its parent's, so subclassing a concrete model forces a schema load of the `wallets_*` tables — which don't exist in apps that only install your gem. The abstract parents make each embedded model its own `base_class`, so the base tables are never consulted.
 
 These class-level hooks are a supported, stable contract (covered by tests — breaking them is a breaking change for downstream gems):
 
@@ -848,11 +1173,14 @@ Your `Transaction`, `Allocation`, and `Transfer` subclasses (of `Wallets::Transa
 
 One current limitation to be aware of: the core models declare their associations against the `Wallets::*` class names, so your subclasses should **re-declare associations** with your own classes (`belongs_to :wallet, class_name: "MyGem::Wallet"`, etc.) so that records load as your subclasses rather than the core ones. See `usage_credits`' models for the canonical embedding pattern.
 
+Holds are opt-in for embedded ledgers. See [Embedding holds in your own ledger](#embedding-holds-in-your-own-ledger).
+
 ## TODO
 
 - Dynamic association class resolution for embedded subclasses (so embedders don't need to re-declare associations)
 - First-class transfer reversal/refund API built on compensating ledger entries
-- Optional pending/held balance primitives for escrow-like flows
+- Holds on incoming transfers (`transfer_to(..., hold:)`), so a recipient's credits can arrive held in the same step
+- Partial credit holds, once a real use case shows whether two holds on one credit should overlap or add up
 - Multi-step transfer policies beyond `:preserve`, `:none`, and fixed `expires_at`
 
 ## Development

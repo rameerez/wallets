@@ -18,6 +18,8 @@ class Wallets::ConfigurationTest < ActiveSupport::TestCase
     assert_nil configuration.on_low_balance_reached_callback
     assert_nil configuration.on_balance_depleted_callback
     assert_nil configuration.on_insufficient_balance_callback
+    assert_nil configuration.on_hold_created_callback
+    assert_nil configuration.on_hold_released_callback
   end
 
   test "normalizes and validates configuration values" do
@@ -66,6 +68,8 @@ class Wallets::ConfigurationTest < ActiveSupport::TestCase
     low_balance = -> {}
     depleted = -> {}
     insufficient = -> {}
+    hold_created = -> {}
+    hold_released = -> {}
 
     configuration.on_balance_credited(&credited)
     configuration.on_balance_debited(&debited)
@@ -73,6 +77,8 @@ class Wallets::ConfigurationTest < ActiveSupport::TestCase
     configuration.on_low_balance_reached(&low_balance)
     configuration.on_balance_depleted(&depleted)
     configuration.on_insufficient_balance(&insufficient)
+    configuration.on_hold_created(&hold_created)
+    configuration.on_hold_released(&hold_released)
 
     assert_equal credited, configuration.on_balance_credited_callback
     assert_equal debited, configuration.on_balance_debited_callback
@@ -80,6 +86,8 @@ class Wallets::ConfigurationTest < ActiveSupport::TestCase
     assert_equal low_balance, configuration.on_low_balance_reached_callback
     assert_equal depleted, configuration.on_balance_depleted_callback
     assert_equal insufficient, configuration.on_insufficient_balance_callback
+    assert_equal hold_created, configuration.on_hold_created_callback
+    assert_equal hold_released, configuration.on_hold_released_callback
   end
 
   test "low_balance_threshold accepts zero, nil, and numeric strings" do

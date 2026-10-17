@@ -9,7 +9,7 @@ Gem::Specification.new do |spec|
   spec.email = ["rubygems@rameerez.com"]
 
   spec.summary = "Add user wallets with money-like balances to your Rails app."
-  spec.description = "Allow your users to have wallets with money-like balances for value / assets holding and transferring. Supports multiple currencies. Useful to add append-oriented, multi-asset wallets to your Rails app with balances, transfers, expiration-aware allocations, row-level locking, and full audit trails. Use it for in-game resources, reward apps, marketplace balances, gig-economy earnings, and internal value transfers between app users."
+  spec.description = "Allow your users to have wallets with money-like balances for value / assets holding and transferring. Supports multiple currencies. Useful to add append-oriented, multi-asset wallets to your Rails app with balances, transfers, expiration-aware allocations, holds and reservations for value that is not spendable yet, row-level locking, and full audit trails. Use it for in-game resources, reward apps, marketplace balances, gig-economy earnings, and internal value transfers between app users."
   spec.homepage = "https://github.com/rameerez/wallets"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.2.0"

@@ -202,13 +202,14 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     assert_equal(-15, credit.balance_after)
   end
 
-  test "flipping allow_negative_balance off while a wallet is negative makes subsequent saves fail" do
-    # Documented gotcha: `allow_negative_balance` is meant to be a stable
-    # config decision, not a runtime toggle. The wallet model carries a
-    # `balance >= 0` validation gated on the flag; flipping the flag off
-    # while wallets are below zero leaves them un-saveable, which means
-    # any further `credit` / `debit` (both call `refresh_cached_balance!`
-    # internally, which calls `save!`) raises a validation error.
+  test "flipping allow_negative_balance off while a wallet is negative leaves it saveable" do
+    # The 0.2/0.3 gotcha is gone (0.4, D6): the wallet used to carry a
+    # `balance >= 0` validation gated on the flag, so flipping the flag off
+    # while a wallet was below zero made every later `credit` / `debit` raise
+    # RecordInvalid from `refresh_cached_balance!`. Available balance is now
+    # signed: holds and expiry can take it below zero with overdrafts off, so
+    # a save-time floor would reject the very credit that repays the debt.
+    # The flag keeps its real job: refusing commands that exceed funding.
     Wallets.configuration.allow_negative_balance = true
     owner = users(:new_user)
     wallet = create_wallet(owner, asset_code: :credits, initial_balance: 0)
@@ -221,15 +222,11 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     # AR's "no unpersisted changes" guard. Apps reach this branch by
     # calling `user.wallet(:foo).credit(...)` after a flag flip; this
     # mirrors that.
-    error = assert_raises(ActiveRecord::RecordInvalid) do
-      owner.wallet(:credits).credit(5, category: :reward)
-    end
-    assert_includes error.message, "Balance must be greater than or equal to 0"
-
-    # Recovery: flip the flag back on.
-    Wallets.configuration.allow_negative_balance = true
     owner.wallet(:credits).credit(5, category: :reward)
+
     assert_equal(-15, owner.wallet(:credits).balance)
+    assert_equal(-15, owner.wallet(:credits).read_attribute(:balance), "the cached column stores the signed balance")
+    assert_raises(Wallets::InsufficientBalance) { owner.wallet(:credits).debit(1, category: :purchase) }
   end
 
   test "concurrent debits on the same wallet serialize through with_lock and accumulate correctly" do
@@ -533,7 +530,7 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     # Safety net for the rare race where a bucket expires between the
     # balance pre-check and the FIFO allocation query.
     wallet = create_wallet(users(:new_user), asset_code: :race_guard, initial_balance: 100)
-    wallet.stubs(:allocate_debit!).returns(25)
+    wallet.stubs(:allocate_debit!).returns([stub(amount: 25)])
 
     error = assert_raises(Wallets::InsufficientBalance) { wallet.debit(50, category: :purchase) }
     assert_includes error.message, "balance buckets"
@@ -545,10 +542,9 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     wallet = wallets_wallets(:rich_coins_wallet)
     transfer = stub(id: 42)
     allocation = stub(amount: 30, source_transaction: stub(expires_at: nil))
-    outbound = stub(outgoing_allocations: stub(includes: stub(order: stub(to_a: [allocation]))))
 
     error = assert_raises(Wallets::InvalidTransfer) do
-      wallet.send(:build_preserved_transfer_inbound_credit_specs, transfer, outbound, 100)
+      wallet.send(:build_preserved_transfer_inbound_credit_specs, transfer, [allocation], 100)
     end
 
     assert_includes error.message, "could not preserve expiration buckets"
@@ -560,7 +556,7 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     assert_raises(ArgumentError) do
       wallet.send(
         :build_transfer_inbound_credit_specs,
-        transfer: nil, outbound_transaction: nil, amount: 10,
+        transfer: nil, allocations: [], amount: 10,
         expiration_policy: "bogus", expires_at: nil
       )
     end

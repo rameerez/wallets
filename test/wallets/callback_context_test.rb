@@ -24,6 +24,16 @@ class Wallets::CallbackContextTest < ActiveSupport::TestCase
     )
   end
 
+  test "carries the hold of hold events" do
+    wallet = wallets_wallets(:rich_coins_wallet)
+    hold = Wallets::Hold.new(wallet: wallet, category: :review)
+    context = Wallets::CallbackContext.new(event: :hold_created, wallet: wallet, hold: hold, category: "review")
+
+    assert_same hold, context.hold
+    assert_equal({event: :hold_created, wallet: wallet, hold: hold, category: "review"}, context.to_h)
+    assert_nil Wallets::CallbackContext.new(event: :balance_credited).hold
+  end
+
   test "owner is nil without a wallet" do
     context = Wallets::CallbackContext.new(event: :balance_credited)
 
