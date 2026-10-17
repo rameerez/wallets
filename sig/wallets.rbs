@@ -1,3 +1,85 @@
 module Wallets
   VERSION: String
+
+  class Error < StandardError
+  end
+
+  class InsufficientBalance < Error
+  end
+
+  class InvalidTransfer < Error
+  end
+
+  class InvalidHold < Error
+  end
+
+  class HoldsNotEnabled < Error
+  end
+
+  class ApplicationRecord < ::ActiveRecord::Base
+  end
+
+  # `balance` is the available balance: what can be spent right now.
+  class WalletBase < ApplicationRecord
+    def self.holds_enabled?: () -> bool
+
+    def balance: () -> Integer
+    def available_balance: () -> Integer
+    def held_balance: () -> Integer
+    def total_balance: () -> Integer
+    def on_hold?: () -> bool
+    def holds_enabled?: () -> bool
+
+    def credit: (Integer amount, ?metadata: untyped, ?category: Symbol | String, ?expires_at: untyped, ?transfer: TransferBase?, ?hold: Symbol | String | Hash[untyped, untyped] | nil, ?available_at: untyped, **untyped) -> TransactionBase
+    def debit: (Integer amount, ?metadata: untyped, ?category: Symbol | String, ?transfer: TransferBase?, ?from: untyped, **untyped) -> TransactionBase
+    def transfer_to: (WalletBase other_wallet, Integer amount, ?category: Symbol | String, ?metadata: untyped, ?expiration_policy: Symbol | String | nil, ?expires_at: untyped, ?from: untyped) -> TransferBase
+    def hold: (?TransactionBase credit, category: Symbol | String, ?until: untyped, ?metadata: untyped) -> HoldBase
+    def reserve: (Integer amount, category: Symbol | String, ?until: untyped, ?metadata: untyped) -> HoldBase
+  end
+
+  class Wallet < WalletBase
+    def holds: () -> untyped
+  end
+
+  class TransactionBase < ApplicationRecord
+    def held_amount: (?at: untyped) -> Integer
+    def available_amount: (?at: untyped) -> Integer
+    def held?: (?at: untyped) -> bool
+  end
+
+  class Transaction < TransactionBase
+    def holds: () -> untyped
+    def captured_reservation: () -> Hold?
+  end
+
+  class TransferBase < ApplicationRecord
+  end
+
+  # A credit hold, a wallet hold, or a reservation (see the README).
+  class HoldBase < ApplicationRecord
+    def self.active: (?at: untyped) -> untyped
+    def self.released: () -> untyped
+    def self.coverage: () -> untyped
+    def self.reservations: () -> untyped
+    def self.wallet_scoped: () -> untyped
+    def self.credit_scoped: () -> untyped
+
+    def active?: (?at: untyped) -> bool
+    def released?: () -> bool
+    def lapsed?: (?at: untyped) -> bool
+    def captured?: () -> bool
+    def reservation?: () -> bool
+    def coverage?: () -> bool
+    def wallet_scoped?: () -> bool
+    def credit_scoped?: () -> bool
+
+    def release!: (?reason: String | Symbol | nil, ?metadata: untyped) -> self
+    def capture!: (?Integer? amount, category: Symbol | String, ?metadata: untyped) -> TransactionBase
+  end
+
+  class Hold < HoldBase
+    def wallet: () -> Wallet
+    def credit: () -> Transaction?
+    def capture_transaction: () -> Transaction?
+  end
 end
