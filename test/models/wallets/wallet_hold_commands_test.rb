@@ -241,6 +241,13 @@ class Wallets::WalletHoldCommandsTest < ActiveSupport::TestCase
     end
   end
 
+  test "a wrong argument is reported before a deadline already reached" do
+    foreign = create_wallet(users(:peer_user), asset_code: :points, initial_balance: 100).transactions.sole
+
+    error = assert_raises(ArgumentError) { points_wallet.hold(foreign, category: :review, until: 1.minute.ago) }
+    assert_match(/belongs to another wallet/, error.message)
+  end
+
   test "an expired credit cannot be held, from the exact instant it expires" do
     freeze_time
     wallet = points_wallet

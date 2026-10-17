@@ -8,6 +8,9 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
       t.references :owner, polymorphic: true, null: false, type: foreign_key_type
       t.string :asset_code, null: false
       t.bigint :balance, null: false, default: 0
+      # Incremented by every command, so a stale database snapshot can always
+      # be told from a current one, whatever the clock or a `touch` says.
+      t.bigint :ledger_revision, null: false, default: 0
       t.send(json_column_type, :metadata, null: false, default: json_column_default)
 
       t.timestamps
@@ -137,9 +140,10 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
   end
 
   # MySQL does not allow defaults on JSON columns, so models treat nil metadata
-  # the same as an empty hash when records are loaded.
+  # the same as an empty hash when records are loaded. Rails' Trilogy adapter
+  # talks to MySQL too, under its own name.
   def json_column_default
-    return nil if connection.adapter_name.downcase.include?("mysql")
+    return nil if connection.adapter_name.match?(/mysql|trilogy/i)
 
     {}
   end

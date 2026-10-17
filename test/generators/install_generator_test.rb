@@ -48,6 +48,8 @@ class Wallets::InstallGeneratorTest < Rails::Generators::TestCase
       ActiveRecord::Migration.suppress_messages do
         migration.migrate(:up)
         tables.each { |table| assert connection.data_source_exists?(table), "expected #{table} to be created" }
+        revision = connection.columns("gencheck_wallets").find { |column| column.name == "ledger_revision" }
+        assert_equal [:integer, false, "0"], [revision&.type, revision&.null, revision&.default.to_s], "a fresh install keeps a ledger revision"
         assert connection.indexes("gencheck_transactions").any?, "expected indexes on gencheck_transactions"
         assert connection.indexes("gencheck_transfers").any?, "expected indexes on gencheck_transfers"
         assert connection.check_constraint_exists?(

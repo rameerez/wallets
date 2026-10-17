@@ -115,6 +115,28 @@ class Wallets::HoldTest < ActiveSupport::TestCase
     assert ended_reservation.valid?, ended_reservation.errors.full_messages.to_sentence
   end
 
+  test "a capture link names a debit of the reservation's own wallet, no larger than the reservation" do
+    debit = @wallet.debit(40, category: :purchase)
+    foreign_debit = create_wallet(users(:peer_user), asset_code: :points, initial_balance: 100).debit(10, category: :purchase)
+    captured = lambda do |link, amount|
+      Wallets::Hold.new(wallet: @wallet, amount: amount, category: :booking, released_at: Time.current, release_reason: "captured", capture_transaction: link)
+    end
+
+    assert captured.call(debit, 40).valid?, "the whole reservation"
+    assert captured.call(debit, 50).valid?, "a smaller capture releases the rest"
+
+    {
+      "another wallet's debit" => [foreign_debit, 40, "must belong to the reservation's wallet"],
+      "a credit" => [@credit, 100, "must be a debit"],
+      "a debit larger than the reservation" => [debit, 30, "cannot exceed the reserved amount"]
+    }.each do |description, (link, amount, message)|
+      hold = captured.call(link, amount)
+
+      refute hold.valid?, "#{description} must be refused"
+      assert_includes hold.errors[:capture_transaction], message, description
+    end
+  end
+
   test "a hold needs a wallet, while the credit and the capture debit are optional" do
     orphan = Wallets::Hold.new(category: :review)
 

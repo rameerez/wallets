@@ -9,7 +9,8 @@ class Wallets::InstallTemplatesTest < ActiveSupport::TestCase
     assert_includes template, "Wallets.configuration.table_prefix"
     assert_includes template, "create_table wallets_table"
     assert_includes template, "add_index wallets_table"
-    assert_equal 5, template.scan("t.bigint").size
+    assert_equal 6, template.scan("t.bigint").size
+    assert_includes template, "t.bigint :ledger_revision, null: false, default: 0"
     assert_includes template, 't.string :expiration_policy, null: false, default: "preserve"'
     assert_includes template, '"amount <> 0"'
     assert_includes template, '"from_wallet_id <> to_wallet_id"'

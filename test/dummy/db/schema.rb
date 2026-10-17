@@ -95,6 +95,7 @@ ActiveRecord::Schema[7.2].define(version: 2026_10_17_120000) do
     t.json "metadata", default: {}, null: false
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+    t.bigint "ledger_revision", default: 0, null: false
     t.index ["owner_type", "owner_id", "asset_code"], name: "index_wallets_on_owner_and_asset_code", unique: true
     t.index ["owner_type", "owner_id"], name: "index_wallets_wallets_on_owner"
   end

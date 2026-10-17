@@ -416,6 +416,29 @@ class Wallets::WalletHoldsTest < ActiveSupport::TestCase
     end
   end
 
+  test "a command reads the balance once before and once for its refresh, never to validate" do
+    # Validations read the cached column: recomputing the balance there ran
+    # the whole statement again on every save.
+    wallet = points_wallet(100)
+    hold!(wallet, wallet.transactions.credits.sole)
+    wallet.credit(50, category: :top_up)
+
+    {
+      "a credit" => -> { wallet.credit(10, category: :reward) },
+      "a debit" => -> { wallet.debit(10, category: :purchase) }
+    }.each do |command, run|
+      balance_reads = capture_sql(&run).grep(/COALESCE\(SUM\(CASE WHEN/)
+
+      assert_equal 2, balance_reads.size, "#{command}: one read before, exactly one for its refresh:\n#{balance_reads.join("\n")}"
+    end
+  end
+
+  test "creating a wallet reads no balance and no holds" do
+    statements = capture_sql { create_wallet(@owner, asset_code: :fresh) }
+
+    assert statements.none? { |sql| sql.match?(/SUM\(|wallets_holds/) }, statements.join("\n")
+  end
+
   test "available, held and total come from one set of components" do
     Wallets.configuration.allow_negative_balance = true
     wallet = points_wallet
@@ -775,54 +798,68 @@ class Wallets::WalletHoldsTest < ActiveSupport::TestCase
     end
   end
 
-  test "every command bumps the wallet row, even when the available balance does not move" do
+  test "every command bumps the ledger revision, even when the available balance does not move" do
     # A credit straight under a wallet hold leaves the available balance
-    # where it was. The row must change anyway: it is how a stale snapshot is
-    # told from a current one.
+    # where it was. The revision must move anyway: it is how a stale snapshot
+    # is told from a current one.
     wallet = points_wallet(100)
     hold!(wallet)
     wallet.credit(1, category: :reward)
-    before = wallet.reload.updated_at
+    before = wallet.reload.ledger_revision
 
-    travel 1.second do
-      wallet.credit(10, category: :reward)
-    end
+    wallet.credit(10, category: :reward)
 
     assert_equal 0, wallet.reload.balance
-    assert_operator wallet.updated_at, :>, before
+    assert_equal before + 1, wallet.ledger_revision
   end
 
-  test "a command that moves no balance writes the wallet row even under no_touching" do
+  test "a command that moves no balance bumps the revision even under no_touching" do
     wallet = points_wallet(100)
     hold!(wallet)
-    before = wallet.reload.updated_at
+    before = wallet.reload.ledger_revision
 
-    travel 1.second do
-      Wallets::Wallet.no_touching { wallet.credit(10, category: :reward) }
-    end
+    Wallets::Wallet.no_touching { wallet.credit(10, category: :reward) }
 
-    assert_operator wallet.reload.updated_at, :>, before
+    assert_equal before + 1, wallet.reload.ledger_revision
     assert_equal 0, wallet.read_attribute(:balance)
   end
 
-  test "two commands in one microsecond still leave two different rows behind" do
-    # A frozen clock stands in for two commits within one microsecond: the
-    # second marker steps past the first instead of repeating it.
+  test "neither a frozen clock nor a touch back in time can repeat a revision" do
     freeze_time
     wallet = points_wallet(100)
-    markers = [wallet.reload.updated_at]
+    revisions = [wallet.reload.ledger_revision]
 
-    wallet.debit(10, category: :purchase)               # the balance moves: save!
-    markers << wallet.reload.updated_at
+    wallet.debit(10, category: :purchase)               # the balance moves
+    revisions << wallet.reload.ledger_revision
     hold!(wallet)
-    wallet.credit(5, category: :reward)                 # it does not: the marker alone
-    markers << wallet.reload.updated_at
+    wallet.credit(5, category: :reward)                 # it does not
+    revisions << wallet.reload.ledger_revision
+    wallet.touch(time: 1.year.ago)                      # anyone may touch the row
+    revisions << wallet.reload.ledger_revision
+    assert_equal 1.year.ago, wallet.updated_at, "updated_at is ordinary Rails, and decides nothing"
     wallet.credit(5, category: :reward)
-    markers << wallet.reload.updated_at
+    revisions << wallet.reload.ledger_revision
 
-    assert_equal markers.sort, markers
-    assert_equal markers.uniq, markers, "every command leaves a later marker"
-    assert_equal Rational(1, 1_000_000), markers.last - markers[-2]
+    first = revisions.first
+    assert_equal [first, first + 1, first + 2, first + 2, first + 3], revisions
+  end
+
+  test "a ledger that keeps holds refuses to run without a ledger revision" do
+    # A wallet table that predates the column: fine for a ledger without
+    # holds (see EmbeddabilityTest), never for one that keeps them.
+    revisionless = Class.new(Wallets::Wallet) do
+      def self.name
+        "RevisionlessWallet"
+      end
+
+      self.ignored_columns += ["ledger_revision"]
+    end
+    wallet = revisionless.find(points_wallet(100).id)
+
+    error = assert_raises(Wallets::Error) { wallet.credit(10, category: :reward) }
+
+    assert_equal "RevisionlessWallet keeps holds, so its wallet table needs a ledger_revision column (bigint, not null, default 0)", error.message
+    assert_equal 100, Wallets::Wallet.find(wallet.id).balance, "nothing was written"
   end
 
   test "a stale snapshot is detected against the locked row and remembered past its savepoint" do
@@ -836,7 +873,10 @@ class Wallets::WalletHoldsTest < ActiveSupport::TestCase
       wallet.lock!
       refute wallet.send(:stale_snapshot?), "the snapshot shows the very row the lock returned"
 
-      wallet.updated_at += 1.second # the lock returned a row the snapshot has not seen
+      wallet.updated_at += 1.second
+      refute wallet.send(:stale_snapshot?), "only the ledger revision decides, never updated_at"
+
+      wallet.ledger_revision += 1 # the lock returned a revision the snapshot has not seen
       assert wallet.send(:stale_snapshot?)
 
       wallet.restore_attributes
@@ -851,7 +891,7 @@ class Wallets::WalletHoldsTest < ActiveSupport::TestCase
   test "stale snapshots are never suspected where plain reads are always current" do
     wallet = points_wallet(100)
     Wallets::Wallet.stubs(:current_reads_need_locks?).returns(false)
-    wallet.updated_at += 1.second
+    wallet.ledger_revision += 1
 
     refute wallet.send(:stale_snapshot?)
   ensure

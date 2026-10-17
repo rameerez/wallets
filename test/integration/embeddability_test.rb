@@ -71,6 +71,7 @@ class EmbeddabilityTest < ActiveSupport::TestCase
         connection.data_source_exists?("embedded_transfers") &&
         connection.data_source_exists?("embedded_allocations") &&
         connection.data_source_exists?("embedded_holds") &&
+        connection.column_exists?(:embedded_wallets, :ledger_revision) &&
         connection.column_exists?(:embedded_transfers, :expiration_policy) &&
         connection.column_exists?(:embedded_transactions, :source_reference)
     end
@@ -86,6 +87,7 @@ class EmbeddabilityTest < ActiveSupport::TestCase
         t.references :owner, polymorphic: true, null: false
         t.string :asset_code, null: false
         t.bigint :balance, null: false, default: 0
+        t.bigint :ledger_revision, null: false, default: 0 # every 0.4 wallet table has it
         t.public_send(json_column_type(connection), :metadata, null: false, default: json_column_default(connection))
         t.timestamps
       end
@@ -619,6 +621,49 @@ class EmbeddabilityTest < ActiveSupport::TestCase
       EmbeddedCallbacks.events.map { |event| event[:event] } - [:embedded_low_balance, :embedded_depleted]
 
     assert statements.none? { |sql| sql.match?(/wallets_(holds|transactions|wallets|allocations|transfers)/) }, "the standalone ledger is never touched"
+  end
+
+  test "a ledger without holds on a wallet table that predates ledger_revision keeps working" do
+    # An embedder's 0.3-era schema has no ledger_revision. Every command still
+    # writes a strictly later updated_at, with update_column when the balance
+    # does not move, so even under no_touching and a frozen clock; a stale
+    # snapshot is told by updated_at and balance instead.
+    legacy = Class.new(EmbeddedWallet) do
+      def self.name
+        "EmbeddabilityTest::LegacySchemaWallet"
+      end
+
+      self.ignored_columns += ["ledger_revision"]
+
+      # usage_credits' floored policy: a debit from zero leaves zero.
+      def current_balance
+        [super, 0].max
+      end
+    end
+    EmbeddabilityTest.embedded_config.allow_negative_balance = true
+    freeze_time
+    wallet = legacy.create_for_owner!(owner: users(:new_user), asset_code: :legacy_schema, initial_balance: 10)
+    wallet.debit(10, category: :embedded_charge)
+    markers = [wallet.reload.updated_at]
+
+    ActiveRecord::Base.no_touching { wallet.debit(5, category: :embedded_charge) } # 0 stays 0: the marker alone
+    markers << wallet.reload.updated_at
+    wallet.debit(5, category: :embedded_charge)
+    markers << wallet.reload.updated_at
+
+    assert_equal [Rational(1, 1_000_000)] * 2, markers.each_cons(2).map { |earlier, later| later.to_r - earlier.to_r }, "a microsecond further each time"
+    assert_equal 0, wallet.read_attribute(:balance)
+    assert_equal 0, EmbeddedWallet.find(wallet.id).ledger_revision, "a ledger that cannot see the column never writes it"
+
+    legacy.stubs(:current_reads_need_locks?).returns(true)
+    legacy.transaction(requires_new: true) do
+      wallet.lock!
+      refute wallet.send(:stale_snapshot?)
+
+      wallet.updated_at += 1.second
+      assert wallet.send(:stale_snapshot?), "told by updated_at and balance"
+      raise ActiveRecord::Rollback
+    end
   end
 
   test "readers without holds delegate to the ledger's own balance policy" do

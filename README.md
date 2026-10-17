@@ -501,7 +501,7 @@ How a debit with `from:` is funded:
 - **Deadlines are computed, never announced.** When an `until:` passes, the hold simply stops counting (`lapsed?`), exactly like an expired credit. No job runs and no callback fires: `on_hold_released` fires only for `release!` and for a capture.
 - **The `:preserve` fallback follows what is really unbacked.** A transfer falls back to a single evergreen credit (`:none`) only when part of it is actually unbacked debt, not whenever it exceeds the available balance. This changes one case even without holds: with old debt and fresh expiring credits, a transfer above the net available balance that those credits fully cover now keeps their expiration instead of arriving evergreen.
 - **`insufficient_balance` says what is out of reach.** Its metadata gains `held:` (credit value under holds) and `reserved:` (active reservations), so `available + held + reserved` is the total balance. Both are `0` when nothing is held. The error message names the ones that are not zero: `Insufficient balance (20 < 40; 100 held, 30 reserved)`. A debit with `from:` adds `covered_consumed:` (the held value it would have taken), and a capture adds `available_for_capture:`. Their messages say what was compared, such as `(100 < 101 in the named credits; ...)`, `(10 < 61 - 50 from held credits; ...)` or `(0 < 80 to capture reservation 5; ...)`.
-- **Every change writes the wallet row.** Each command that records something updates the wallet's `updated_at`, even when the available balance does not move, as with a second reason on a held credit or a whole capture. Do not read a new `updated_at` as "the balance changed".
+- **Every change bumps the wallet's `ledger_revision`.** Each command that records something increments it, even when the available balance does not move, as with a second reason on a held credit or a whole capture. It is how a stale MySQL snapshot is told from a current one, and unlike a timestamp, no clock, `no_touching` or `touch` can repeat it. `updated_at` follows ordinary Rails rules. Read a new value of neither as "the balance changed".
 - **The cached `balance` column stores the available balance.** As before, it can go stale through time alone (expiry, and now deadlines), so call `wallet.balance` when the number matters.
 
 ### Hold callbacks
@@ -541,7 +541,7 @@ What each command reports:
 | `debit(..., from:)` | `on_balance_debited` only: nothing is released |
 | A deadline passing | Nothing |
 
-A hold, a reservation or a debit that lowers the available balance can also fire `on_low_balance_reached` and `on_balance_depleted`, once per real crossing. A credit, a release and a deadline never do. Like every success callback, these run after the outermost database transaction commits.
+A hold, a reservation or a debit that lowers the available balance can also fire `on_low_balance_reached` and `on_balance_depleted`, once per real crossing. A credit, a release and a deadline never do. Like every success callback, these run when the command's transaction commits, which is the outermost commit unless a `transaction(joinable: false)` boundary intervenes: inside one, Active Record's own `after_commit` rule applies, and they fire when the command's own transaction completes. A command that failed reports nothing.
 
 ### Upgrading an existing install
 
@@ -551,7 +551,9 @@ rails generate wallets:upgrade
 rails db:migrate
 ```
 
-The upgrade generator writes one migration that adds the holds table to a 0.1, 0.2 or 0.3 install. It follows your `table_prefix`, and reads the key types from the tables you already have, uuid and unsigned keys included. Running it again never writes a second migration, and it writes none at all when the holds table already exists. Rolling the migration back drops the table only while it is empty. Fresh installs get the table from `rails generate wallets:install`.
+> **Migrate before the 0.4.0 code serves traffic.** The new code expects the holds table and the wallets' `ledger_revision` column. Until `rails db:migrate` has added them, reading a `Wallets::Wallet`'s balance, or running any command on it (an initial balance included), raises: a ledger that keeps holds fails loudly on purpose rather than treat held value as spendable. Deploy the migration first, then the code.
+
+The upgrade generator writes one migration that adds the holds table, and a `ledger_revision` column on the wallets table, to a 0.1, 0.2 or 0.3 install. It follows your `table_prefix`, and reads the key types from the tables you already have, uuid and unsigned keys included. Running it again never writes a second migration, and it writes none at all when both already exist. Rolling the migration back removes them only while the holds table is empty. Fresh installs get both from `rails generate wallets:install`.
 
 Then look at where your app reads `wallet.balance`. It still means "what can be spent", so spending checks need no change. Screens and reports that mean "everything the user has", such as a total earned or a reconciliation against the cached column, should read `total_balance`.
 
@@ -588,6 +590,7 @@ end
 ```
 
 - Create the table with the same columns, check constraints and indexes as `wallets_holds`. The install template has them.
+- Add `ledger_revision` to your wallets table, which is one `add_column :my_gem_wallets, :ledger_revision, :bigint, null: false, default: 0`. It is the robust marker for telling a stale MySQL snapshot from a current one, and a ledger that keeps holds refuses to run without it. A ledger without holds whose table lacks it still works, on a strictly increasing `updated_at` compared with `balance`, but another connection's `touch(time:)` can spoof that.
 - If your wallets can be destroyed, destroy their holds first. `Wallets::Wallet` does it in a `before_destroy` callback declared with `prepend: true`, so the holds go before the transactions they point at.
 - If you override `current_balance`, decide on purpose how it treats held and reserved value. With holds on, `balance`, `held_balance` and `total_balance` come from one set of terms. Overriding `current_balance` alone can break `total_balance == balance + held_balance`, so keep all three coherent.
 - `credit` now takes the keywords `hold:` and `available_at:`, and `debit` takes `from:`. If your transaction table has columns by those names, you can no longer pass them through `credit` or `debit` as extra attributes.
@@ -596,7 +599,7 @@ end
 
 With holds on, `balance`, `held_balance` and `total_balance` are each one SQL statement: the same sums over the wallet's transactions as before, plus an indexed `EXISTS` lookup on the holds table for each credit and one sum over the active reservations. Without holds, reading a balance runs exactly the 0.3 queries.
 
-On MySQL, a transaction's snapshot is fixed by its first read (repeatable read). If your code reads something and then calls a wallet command in the same transaction, a plain read taken after the wallet lock could miss what another transaction just committed to that wallet. So each command compares the wallet row its snapshot shows with the row the lock returns. When they differ, that command's ledger reads become locking reads, which always see the latest rows, and so do the reads of every later command in the same transaction, until that transaction commits or rolls back. A wallet your own code saved or touched earlier in the transaction counts as stale too, because its snapshot would otherwise look current. Locking reads are not used every time, because InnoDB's gap locks would then make unrelated wallets deadlock each other. PostgreSQL and SQLite always read the latest rows and never need this. It relies on every ledger change going through the wallet API, which writes the wallet row each time: raw SQL writes to the wallet row (`update_columns` included), and holds written as `Wallets::Hold` rows instead of through `hold`, `reserve` and `credit(hold:)`, are outside the supported API. The full reasoning is in [the 0.4 plan](docs/plans/2026-10-17-holds-and-reservations.md#6-operations).
+On MySQL, a transaction's snapshot is fixed by its first read (repeatable read). If your code reads something and then calls a wallet command in the same transaction, a plain read taken after the wallet lock could miss what another transaction just committed to that wallet. So each command compares the wallet's `ledger_revision`, which every command increments, as its snapshot shows it with the one the lock returns. When they differ, that command's ledger reads become locking reads, which always see the latest rows, and so do the reads of every later command in the same transaction, until that transaction commits or rolls back. A wallet your own code saved or touched earlier in the transaction counts as stale too, because its snapshot would otherwise look current. Locking reads are not used every time, because InnoDB's gap locks would then make unrelated wallets deadlock each other. PostgreSQL and SQLite always read the latest rows and never need this. It relies on every ledger change going through the wallet API, which increments the revision each time: raw SQL writes to the wallet row (`update_columns` included), and holds written as `Wallets::Hold` rows instead of through `hold`, `reserve` and `credit(hold:)`, are outside the supported API. The full reasoning is in [the 0.4 plan](docs/plans/2026-10-17-holds-and-reservations.md#6-operations).
 
 ### Not in this release
 
@@ -641,7 +644,7 @@ end
 
 `wallets` ships with lifecycle callbacks you can use for notifications, analytics, or product logic.
 
-Successful callbacks run after the outermost database transaction commits. If a caller wraps a wallet operation in a larger transaction and later rolls it back, no success callback is emitted. Callback exceptions are logged and isolated from the already-committed ledger write. `on_insufficient_balance` remains immediate because it describes a rejected operation rather than a committed row.
+Successful callbacks run when the command's transaction commits, which is the outermost database transaction's commit unless a `transaction(joinable: false)` boundary intervenes (inside one, as with Active Record's own `after_commit`, they fire when the command's own transaction completes). If a caller wraps a wallet operation in a larger transaction and later rolls it back, no success callback is emitted, and a command that fails emits none even when the caller rescues the error and commits. Callback exceptions are logged and isolated from the already-committed ledger write. `on_insufficient_balance` remains immediate because it describes a rejected operation rather than a committed row.
 
 ```ruby
 Wallets.configure do |config|

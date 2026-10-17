@@ -19,8 +19,24 @@ module Wallets
   class ApplicationRecord < ::ActiveRecord::Base
   end
 
+  class Configuration
+    def on_hold_created: () { (CallbackContext) -> void } -> void
+    def on_hold_released: () { (CallbackContext) -> void } -> void
+    def on_hold_created_callback: () -> Proc?
+    def on_hold_released_callback: () -> Proc?
+  end
+
+  # The payload every lifecycle callback receives.
+  class CallbackContext < Struct[untyped]
+    def hold: () -> HoldBase?
+  end
+
   # `balance` is the available balance: what can be spent right now.
   class WalletBase < ApplicationRecord
+    # The capability switch: nil keeps no holds (the default on WalletBase).
+    def self.hold_class_name: () -> String?
+    def self.hold_class_name=: (String? name) -> String?
+    def self.hold_class: () -> singleton(HoldBase)
     def self.holds_enabled?: () -> bool
 
     def balance: () -> Integer

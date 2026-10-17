@@ -62,6 +62,7 @@ module Wallets
       validates :transaction_id, absence: {message: "must be blank on a captured reservation"}
       validates :amount, presence: {message: "can't be blank on a captured reservation"}
       validates :released_at, presence: {message: "can't be blank on a captured reservation"}
+      validate :capture_must_be_a_debit_of_this_reservation
     end
 
     before_validation :normalize_category!
@@ -152,6 +153,20 @@ module Wallets
     end
 
     private
+
+    # What the link names, not just that it exists: one of this wallet's
+    # debits, no larger than what was reserved. A dangling id is left to the
+    # foreign key.
+    def capture_must_be_a_debit_of_this_reservation
+      debit = capture_transaction
+      return if debit.nil?
+
+      errors.add(:capture_transaction, "must be a debit") unless debit.debit?
+      errors.add(:capture_transaction, "must belong to the reservation's wallet") unless debit.wallet_id == wallet_id
+      if debit.debit? && amount.is_a?(Integer) && debit.amount.abs > amount
+        errors.add(:capture_transaction, "cannot exceed the reserved amount")
+      end
+    end
 
     def normalize_category!
       self.category = category.to_s.strip.presence

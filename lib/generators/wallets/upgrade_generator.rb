@@ -18,15 +18,16 @@ module Wallets
 
       # Idempotent on purpose: a second run (even after a Rails upgrade has
       # changed the rendered migration version) points at the migration it
-      # already wrote instead of adding a duplicate, and an app whose holds
-      # table already exists (a fresh 0.4 install) gets no migration at all,
-      # so it can never hold a rollback that would drop that table.
+      # already wrote instead of adding a duplicate, and an app whose 0.4
+      # schema is already complete (a fresh 0.4 install: the holds table and
+      # the wallets' ledger revision) gets no migration at all, so it can
+      # never hold a rollback that would drop them.
       def create_holds_migration
         existing_migration = self.class.migration_exists?(File.expand_path(db_migrate_path, destination_root), "add_wallets_holds")
 
         if existing_migration
           say_status :exist, relative_to_original_destination_root(existing_migration), :blue
-        elsif holds_table_exists?
+        elsif upgraded_schema?
           @skipped = true
           say_status :skip, "#{holds_table} already exists: there is nothing to migrate", :yellow
         else
@@ -51,14 +52,20 @@ module Wallets
 
       # Asks the database when it can. One that does not exist yet, or cannot
       # be reached, gets the migration anyway: its `up` checks again.
-      def holds_table_exists?
-        ActiveRecord::Base.with_connection { |connection| connection.table_exists?(holds_table) }
+      def upgraded_schema?
+        ActiveRecord::Base.with_connection do |connection|
+          connection.table_exists?(holds_table) && connection.column_exists?(wallets_table, :ledger_revision)
+        end
       rescue ActiveRecord::ActiveRecordError
         false
       end
 
       def holds_table
         "#{Wallets.configuration.table_prefix}holds"
+      end
+
+      def wallets_table
+        "#{Wallets.configuration.table_prefix}wallets"
       end
 
       def migration_version

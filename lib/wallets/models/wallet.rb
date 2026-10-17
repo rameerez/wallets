@@ -44,7 +44,8 @@ module Wallets
     SNAPSHOT_READ_ADAPTERS = /mysql|trilogy/i
     private_constant :SNAPSHOT_READ_ADAPTERS
 
-    # The smallest step the wallet row's `updated_at` column can record.
+    # The smallest step the wallet row's `updated_at` column can record (the
+    # timestamp marker of wallet tables without `ledger_revision`).
     MARKER_STEP = Rational(1, 1_000_000)
     private_constant :MARKER_STEP
 
@@ -189,7 +190,8 @@ module Wallets
     # overdraft (reserve 80 of 100, then a fraud hold covers the 100; or
     # reserved value expires). A save-time floor would reject the very hold,
     # release or incoming credit that follows. Commands enforce funding under
-    # the wallet lock instead.
+    # the wallet lock instead. The cached column is what is validated, never
+    # the `balance` reader (see `read_attribute_for_validation`).
     validates :balance, numericality: {only_integer: true}
 
     before_validation :normalize_asset_code!
@@ -296,6 +298,14 @@ module Wallets
 
     def available_balance
       balance
+    end
+
+    # Validations read the cached `balance` column. The `balance` reader
+    # computes the available balance from the whole ledger, so validating it
+    # would run that statement on every save (several times per command) and
+    # make even `create!` read the holds table.
+    def read_attribute_for_validation(attribute)
+      (attribute.to_s == "balance") ? read_attribute(:balance) : super
     end
 
     # Value in the ledger that holds keep out of `balance`: held credits plus
@@ -441,8 +451,10 @@ module Wallets
 
       with_lock(requires_new: true) do
         mutating_at(Time.current) do
-          ensure_deadline_ahead!(releases_at)
+          # The target first: a wrong argument is a wrong argument, whatever
+          # the deadline says.
           ensure_holdable!(credit) unless credit.nil?
+          ensure_deadline_ahead!(releases_at)
 
           place_hold!(credit: credit, category: category, releases_at: releases_at, metadata: metadata)
         end
@@ -735,13 +747,15 @@ module Wallets
     # Called with the wallet lock held.
     #
     # Only when this transaction's snapshot is stale for this wallet: every
-    # command bumps the wallet row under its lock (`refresh_cached_balance!`),
-    # so when the row this transaction's snapshot shows is the row the lock
-    # returned, nothing was committed to this wallet's ledger after the
-    # snapshot and plain reads already see it as it is now. That covers every
-    # command that runs first in its transaction, or in a transaction that
-    # created the wallet, or that read before taking the lock without anyone
-    # writing in between.
+    # command increments the wallet's `ledger_revision` under its lock
+    # (`refresh_cached_balance!`), so when the revision this transaction's
+    # snapshot shows is the revision the lock returned, nothing was committed
+    # to this wallet's ledger after the snapshot and plain reads already see
+    # it as it is now. That covers every command that runs first in its
+    # transaction, or in a transaction that created the wallet, or that read
+    # before taking the lock without anyone writing in between. A counter,
+    # not a timestamp: no clock, `no_touching` or `touch(time:)` can make two
+    # revisions of the ledger look alike.
     #
     # Locking reads everywhere would be correct but not safe to run: InnoDB
     # takes gap locks on the ranges they scan, and the gaps after a wallet's
@@ -757,11 +771,34 @@ module Wallets
       return false unless self.class.current_reads_need_locks?
       return true if remembered_stale_snapshots.key?(stale_snapshot_key)
 
-      snapshot = self.class.uncached { self.class.unscoped.where(id: id).pick(:updated_at, :balance) }
-      return false if snapshot == [updated_at, read_attribute(:balance)]
+      columns = row_marker_columns
+      snapshot = self.class.uncached { self.class.unscoped.where(id: id).pick(*columns) }
+      return false if Array.wrap(snapshot) == columns.map { |column| read_attribute(column) }
 
       remember_stale_snapshot!
       true
+    end
+
+    # What tells one committed state of this wallet's ledger from another:
+    # its `ledger_revision`. See `ledger_revision?` for tables without one.
+    def row_marker_columns
+      ledger_revision? ? %w[ledger_revision] : %w[updated_at balance]
+    end
+
+    # Whether the wallet table has `ledger_revision`, as every 0.4 schema
+    # does. The counter is the robust marker. A ledger without holds on an
+    # embedder's 0.3-era table falls back to a strictly increasing
+    # `updated_at` (see `next_row_marker`) compared together with `balance`:
+    # it keeps those schemas working, but another connection's
+    # `touch(time:)` can still spoof it, so embedders should add the column
+    # (bigint, not null, default 0). A ledger that keeps holds refuses to run
+    # without it, like a ledger whose holds table is missing: a spoofed
+    # marker could let a stale read spend held value.
+    def ledger_revision?
+      return true if has_attribute?(:ledger_revision)
+      return false unless holds_enabled?
+
+      raise Error, "#{self.class.name} keeps holds, so its wallet table needs a ledger_revision column (bigint, not null, default 0)"
     end
 
     # Remembers the verdict with the real transaction it belongs to. The
@@ -1583,39 +1620,45 @@ module Wallets
     # any cache it can go stale through time alone (expiry, lapsed deadlines),
     # so it is never authoritative for accounting.
     #
-    # The row is written every time, with a strictly later `updated_at`, even
-    # when the balance did not move (a second reason on a held credit, a
-    # capture of a whole reservation): every committed change to the ledger
-    # must change the wallet row, which is how `stale_snapshot?` knows a
-    # snapshot is current (and how PostgreSQL's repeatable read detects a
-    # concurrent update on `lock!`). Hence `update_column` rather than
-    # `touch`, which writes nothing under `no_touching`.
+    # Every command increments `ledger_revision`, even when the balance did
+    # not move (a second reason on a held credit, a capture of a whole
+    # reservation): every committed change to the ledger must change the
+    # wallet row, which is how `stale_snapshot?` knows a snapshot is current
+    # (and how PostgreSQL's repeatable read detects a concurrent update on
+    # `lock!`). `updated_at` then follows ordinary Rails rules and decides
+    # nothing. A wallet table without the column (see `ledger_revision?`)
+    # gets the timestamp marker instead, written with `update_column` when
+    # the balance did not move, because `touch` writes nothing under
+    # `no_touching`.
     #
     # `update!` rather than assigning and then saving: if the command's
     # savepoint rolls back afterwards, Active Record leaves the wallet with no
     # pending changes, so its next command can lock it. It is clean, not
-    # restored: it keeps the rolled-back `balance` and `updated_at` in memory
-    # until that lock reloads the row. Assigning first would leave the new
-    # balance pending instead, and no later command could lock the wallet.
+    # restored: it keeps the rolled-back values in memory until that lock
+    # reloads the row. Assigning first would leave them pending instead, and
+    # no later command could lock the wallet.
     def refresh_cached_balance!
       available = current_balance
-      marker = next_row_marker
 
-      if available == read_attribute(:balance)
-        update_column(:updated_at, marker)
-      else
-        refreshing_cached_balance { update!(balance: available, updated_at: marker) }
+      refreshing_cached_balance do
+        if ledger_revision?
+          update!(balance: available, ledger_revision: ledger_revision + 1)
+        elsif available == read_attribute(:balance)
+          update_column(:updated_at, next_row_marker)
+        else
+          update!(balance: available, updated_at: next_row_marker)
+        end
       end
 
       available
     end
 
-    # The wallet row's next `updated_at`: the command's instant, or one
-    # microsecond past the current marker when the clock has not moved past
-    # it (two commands within a microsecond, a frozen clock), so no two
-    # commits ever leave the same row behind. Assumes the column keeps
-    # microseconds, as `t.timestamps` does from Rails 7 on (datetime(6)); a
-    # column truncating to whole seconds could repeat a marker.
+    # The timestamp marker of a wallet table without `ledger_revision`: the
+    # command's instant, or one microsecond past the current `updated_at`
+    # when the clock has not moved past it (two commands within a
+    # microsecond, a frozen clock), so no two commits leave the same row
+    # behind. Assumes the column keeps microseconds, as `t.timestamps` does
+    # from Rails 7 on (datetime(6)).
     def next_row_marker
       now = evaluation_time
       now = now.change(usec: now.usec) # the column's precision

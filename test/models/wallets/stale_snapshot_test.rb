@@ -79,7 +79,7 @@ class Wallets::StaleSnapshotTest < ActiveSupport::TestCase
 
     Wallets::Wallet.transaction(joinable: false) do
       @wallet.lock!
-      @wallet.updated_at += 1.second # the lock returned a row the snapshot has not seen
+      @wallet.ledger_revision += 1 # the lock returned a revision the snapshot has not seen
       assert @wallet.send(:stale_snapshot?)
       @wallet.restore_attributes
 

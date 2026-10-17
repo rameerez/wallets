@@ -132,6 +132,37 @@ class CurrentReadsTest < ActiveSupport::TestCase
     assert_equal 0, @wallet.reload.read_attribute(:balance)
   end
 
+  test "a touch back in time cannot hide a hold committed after the caller's first read" do
+    # A snapshots the credit covered by its fraud hold. B adds a dispute over
+    # the same value (the balance does not move) and touches the wallet back
+    # to the updated_at A saw. Only the ledger revision still tells A that its
+    # snapshot is stale: released, A's hold must leave the credit held.
+    fraud = @wallet.hold(@credit, category: :fraud_review)
+    seen_by_a = @wallet.reload.updated_at
+    released = Queue.new
+    Wallets.configuration.on_hold_released { |context| released << context.new_balance }
+
+    dispute_and_hide_it = lambda do
+      twin = Wallets::Wallet.find(@wallet.id)
+      twin.hold(Wallets::Transaction.find(@credit.id), category: :dispute)
+      twin.touch(time: seen_by_a)
+      assert_equal seen_by_a, twin.reload.updated_at, "the touch restores what A saw"
+    end
+
+    outcome = after_a_stale_read(dispute_and_hide_it) do |stale|
+      Wallets::Hold.find(fraud.id).release!
+      stale.debit(10, category: :purchase)
+    rescue Wallets::InsufficientBalance => error
+      error
+    end
+
+    assert_equal [0], drain(released), "available reads 0: the dispute still holds the credit"
+    assert_kind_of Wallets::InsufficientBalance, outcome, "the debit is refused"
+    assert_empty @wallet.transactions.debits
+    assert_equal 100, @credit.reload.remaining_amount
+    assert_equal 0, @wallet.read_attribute(:balance)
+  end
+
   test "a preserved transfer keeps the expiry of a credit committed after its caller's first read" do
     sender = new_wallet
     recipient = new_wallet
