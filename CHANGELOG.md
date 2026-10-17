@@ -1,4 +1,4 @@
-## [0.4.0] - Unreleased
+## [0.4.0] - 2026-10-17
 
 Holds and reservations: value that is in the ledger but not spendable yet, read the way a bank statement reads it. `wallet.balance` is the available balance, `wallet.held_balance` is what is pending, and `wallet.total_balance` is both together. Existing installs run `rails generate wallets:upgrade && rails db:migrate`, then read **Changed**: `balance` now leaves held value out. **Run the migration before the 0.4.0 code serves traffic**: it adds the holds table and the wallets' `ledger_revision` column, and until both exist every balance read and every command on `Wallets::Wallet` raises. A ledger with holds enabled and no holds table fails loudly on purpose.
 
