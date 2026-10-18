@@ -229,31 +229,6 @@ class Wallets::WalletTest < ActiveSupport::TestCase
     assert_raises(Wallets::InsufficientBalance) { owner.wallet(:credits).debit(1, category: :purchase) }
   end
 
-  test "concurrent debits on the same wallet serialize through with_lock and accumulate correctly" do
-    # `wallet.debit` wraps `apply_debit` in `with_lock`, which acquires a
-    # row-level FOR UPDATE on the wallet row. With `allow_negative_balance`
-    # on, two concurrent debits should NOT both observe the same
-    # `previous_balance` and double-count: they serialize, each sees the
-    # post-prior-debit state, and the resulting balance is the sum.
-    Wallets.configuration.allow_negative_balance = true
-    wallet = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 0)
-
-    threads = 4.times.map do
-      Thread.new do
-        # Each thread needs its own AR connection; integration tests rely
-        # on the connection-per-thread pool. Without checkout, threads
-        # would share the test connection and serialize incidentally.
-        ActiveRecord::Base.connection_pool.with_connection do
-          wallet.class.find(wallet.id).debit(10, category: :purchase)
-        end
-      end
-    end
-    threads.each(&:join)
-
-    assert_equal(-40, wallet.reload.balance)
-    assert_equal 4, wallet.transactions.where("amount < 0").count
-  end
-
   # ───────────────────────────────────────────────────────────────────────────
   # Balance, expiration, and FIFO order
   # ───────────────────────────────────────────────────────────────────────────

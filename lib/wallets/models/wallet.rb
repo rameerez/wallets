@@ -1252,7 +1252,6 @@ module Wallets
     # never the instant in between where the reservation is gone and the
     # debit not yet posted: capturing a fully reserved wallet reads 0 -> 0.
     def capture_reservation!(reservation, amount, category:, metadata:)
-      amount = normalize_positive_amount!(amount) unless amount.nil?
       metadata = normalize_metadata(metadata)
 
       ending_hold(reservation) do
@@ -1261,11 +1260,7 @@ module Wallets
           # read in this transaction saw.
           reservation.lock!
           ensure_capturable!(reservation)
-
-          amount ||= reservation.amount
-          if amount > reservation.amount
-            raise ArgumentError, "Cannot capture #{amount}: reservation #{reservation.id} sets aside #{reservation.amount}"
-          end
+          amount = capture_amount(reservation, amount)
 
           previous_balance = balance
           available_for_capture = previous_balance + reservation.amount
@@ -1290,6 +1285,22 @@ module Wallets
           debit
         end
       end
+    end
+
+    # What a capture takes: the reserved amount unless told otherwise, and
+    # never more. A positive whole number, parsed like any debit's. Read only
+    # once the reservation is known to be capturable, so that retrying a
+    # finished capture raises Wallets::InvalidHold whatever amount it
+    # repeats, never an ArgumentError about the amount.
+    def capture_amount(reservation, amount)
+      return reservation.amount if amount.nil?
+
+      amount = normalize_positive_amount!(amount)
+      if amount > reservation.amount
+        raise ArgumentError, "Cannot capture #{amount}: reservation #{reservation.id} sets aside #{reservation.amount}"
+      end
+
+      amount
     end
 
     # Only an active reservation can be captured, and only once. Read at the

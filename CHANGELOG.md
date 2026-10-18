@@ -1,3 +1,24 @@
+## [0.4.1] - Unreleased
+
+### Documentation
+
+- **Vesting.** A new "Vesting rewards" example: a referral bonus that unlocks in 14 days, a creator reward that vests 400 points a month, and a signup bonus the app releases when the member completes their first order, with `balance`, `held_balance` and `total_balance` read in between.
+- **The bank-statement model.** A new "Bank-style accounts and fintech" example walks one day of an account (a salary that clears the next morning, a fuel pre-authorisation captured for less, a hotel hold that falls off) and reads the available and current balances after each step.
+- **Retained credit.** A new "Retained rewards and reviews" example: a reward credited now and retained until a partner programme reimburses it, a review that retains one credit, several, or the whole account, how the app reads the reasons to explain them, and the two endings, `release!` or `from:`.
+- **Escrow-style bookings and marketplaces.** The home-services example reserves the price at booking and captures the real cost at delivery, and a new "Marketplace seller earnings" example credits a sale held through the return window and cancels it with `from:` on a return.
+- **Holds in the existing stories.** Loyalty points pending until the return window closes, gig fares that clear before the weekly payout, a tip retained during a dispute, and a tournament prize retained during an anti-cheat review. "Use it for", "Perfect use cases" and "Key signals" now include value that must exist before it may be spent.
+- **Corrected: reconciling the cached column.** The upgrade notes said a reconciliation against the cached `balance` column should read `total_balance`. The column stores the available balance, so it is reconciled with `wallet.balance`, and the two can still differ through time alone, as credits expire and deadlines pass. `total_balance` is for displays of everything the user has.
+- **Corrected: what the ledger records.** "Why this gem" said every balance change made through the wallet API creates a transaction row. Movements of value do. Holds, reservations and their releases change what is available through hold rows instead, so the available balance over time is rebuilt from both.
+- Every new README sample runs as a test (`ReadmeUseCasesTest`) that asserts the values its comments promise, and `ReadmeHoldsTest` pins both corrections.
+
+### Fixed
+
+- **`capture!` checks the reservation's state before the amount**, as the README promised: retrying a finished capture (captured, released or lapsed) now raises `Wallets::InvalidHold` whatever amount it carries, so a retry handler that rescues `InvalidHold` is never bypassed by an `ArgumentError`. An invalid amount on an active reservation still raises `ArgumentError`; it is now refused inside the command's savepoint, after the locks, and nothing is written either way.
+
+### Tests
+
+- The concurrency tests that did not race do now: the threaded wallet and transfer tests moved into the non-transactional harness with distinct real connections, the stubbed lock-order test became one that records the actual `FOR UPDATE` statements in both directions, and a new test races overdraft transfers from one wallet. The stale-read helper uses bounded waits, propagates worker errors and cleans up its threads and connections, and every racer holds its own connection before any of them starts, each spawned once the one before is ready; four harness tests prove a failing race fails fast and leaves nothing behind, whether the worker, the interleaved write, the block or a racer's connection fails, and a pool too small for a race fails it at once instead of hanging it. Both winner orders of a capture racing a release now run deterministically through the stale-read helper, as both orders of a hold racing a debit already did. The upgrade generator test edits the generated migration with a sentinel line, so every Rails version sees a file that differs from the template. 564 runs on SQLite, PostgreSQL and MySQL.
+
 ## [0.4.0] - 2026-10-17
 
 Holds and reservations: value that is in the ledger but not spendable yet, read the way a bank statement reads it. `wallet.balance` is the available balance, `wallet.held_balance` is what is pending, and `wallet.total_balance` is both together. Existing installs run `rails generate wallets:upgrade && rails db:migrate`, then read **Changed**: `balance` now leaves held value out. **Run the migration before the 0.4.0 code serves traffic**: it adds the holds table and the wallets' `ledger_revision` column, and until both exist every balance read and every command on `Wallets::Wallet` raises. A ledger with holds enabled and no holds table fails loudly on purpose.

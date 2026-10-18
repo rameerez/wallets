@@ -17,8 +17,9 @@ Use it for:
 - **Multi-currency balances**: EUR, USD, GBP wallets per user
 - **Game resources**: Wood, stone, gems, gold, energy; any virtual economy
 - **Telecom / SIM data plans**: "This plan gives you 10 GB per month, transfer unused data to friends"
+- **Pending, vesting & retained value**: A referral bonus that unlocks in 14 days, seller earnings held through the return window, a booking price set aside until delivery, a reward retained until a review clears
 
-At its core, `wallets` provides your users with: a wallet with balance, a log of transactions, expirable balances, and transfers between users.
+At its core, `wallets` provides your users with: a wallet with balance, a log of transactions, expirable balances, pending balances, and transfers between users.
 
 For example, imagine you're building a SIM card app with data plans. At the beginning of each month, you give your users expirable data and call minutes:
 
@@ -50,7 +51,7 @@ user.wallet(:mb).balance  # => 6656 MB remaining
 | Feature | What it does |
 |---------|--------------|
 | **Multi-asset** | One wallet per asset: `user.wallet(:usd)`, `user.wallet(:gems)` |
-| **Append-oriented ledger API** | Every balance change made through the wallet API creates a transaction row |
+| **Append-oriented ledger API** | Every movement of value made through the wallet API creates a transaction row. Holds, reservations and their releases change what is available through hold rows instead, so the available balance over time is rebuilt from both |
 | **Expiration-aware allocation** | Debits consume soonest-expiring credits first, then the oldest bucket |
 | **Holds and reservations** | Keep value pending or set aside: `balance` is what can be spent, `held_balance` what is held |
 | **Linked transfers** | Both sides of a transfer are recorded and queryable |
@@ -555,7 +556,7 @@ rails db:migrate
 
 The upgrade generator writes one migration that adds the holds table, and a `ledger_revision` column on the wallets table, to a 0.1, 0.2 or 0.3 install. It follows your `table_prefix`, and reads the key types from the tables you already have, uuid and unsigned keys included. Running it again never writes a second migration, and it writes none at all when both already exist. Rolling the migration back removes them only while the holds table is empty. Fresh installs get both from `rails generate wallets:install`.
 
-Then look at where your app reads `wallet.balance`. It still means "what can be spent", so spending checks need no change. Screens and reports that mean "everything the user has", such as a total earned or a reconciliation against the cached column, should read `total_balance`.
+Then look at where your app reads `wallet.balance`. It still means "what can be spent", so spending checks need no change. Screens and reports that mean "everything the user has", such as a total earned, should read `total_balance`. A reconciliation of the cached `balance` column compares it with `wallet.balance`, never with `total_balance`: the column stores the available balance, so reserving 30 of 100 leaves it at 70 while `total_balance` reads 100. Even then the two can differ through time alone, as credits expire and deadlines pass.
 
 ### Embedding holds in your own ledger
 
@@ -820,6 +821,25 @@ player.wallet(:gold).transfer_to(
 )
 ```
 
+A tournament prize can wait for the anti-cheat review. It arrives held, so the player sees it but cannot spend it until the match is cleared:
+
+```ruby
+prize = player.wallet(:gems).credit(
+  1_000,
+  category: :tournament_prize,
+  hold: { category: :anti_cheat_review, metadata: { match_id: 314 } }
+)
+
+player.wallet(:gems).held_balance    # => 1000, on the player's screen, not spendable yet
+
+# The match is clean: the gems are the player's to spend
+prize.holds.find_by(category: :anti_cheat_review).release!(reason: "match_clean")
+player.wallet(:gems).held_balance    # => 0, the 1,000 gems are in balance now
+
+# Or cheating is confirmed: the prize is taken back instead
+player.wallet(:gems).debit(1_000, category: :prize_revoked, from: prize)
+```
+
 ### Home services booking app
 
 A home-services app where the platform collects the customer payment, keeps its fee, and later pays the provider:
@@ -875,6 +895,32 @@ lucia.wallet(:usd_cents).debit(
   metadata: { stripe_transfer_id: "tr_xxx" }
 )
 ```
+
+Or charge the way a card does: set the price aside when Sara books, and capture what the job really cost once it is done. She cannot spend the same money twice in the meantime:
+
+```ruby
+# Sara has $80.00 and books a 2-hour cleaning for $50.00: the price is set aside, not charged
+reservation = sara.wallet(:usd_cents).reserve(
+  5000,
+  category: :booking,
+  until: 3.days.from_now,
+  metadata: { booking_id: booking.id }
+)
+
+sara.wallet(:usd_cents).balance        # => 3000
+sara.wallet(:usd_cents).held_balance   # => 5000
+
+# The cleaning took 1.5 hours: charge $37.50, and the rest goes back to Sara
+ActiveRecord::Base.transaction do
+  charge = reservation.capture!(3750, category: :booking_charge, metadata: { booking_id: booking.id })
+  marketplace.wallet(:usd_cents).credit(3750, category: :booking_charge, metadata: { booking_id: booking.id, charge_id: charge.id })
+end
+
+sara.wallet(:usd_cents).balance        # => 4250
+sara.wallet(:usd_cents).held_balance   # => 0
+```
+
+A capture is a debit, like a card charge, so the marketplace's credit is written next to it in one database transaction. From there the marketplace keeps its fee and pays Lucia out of the 3,750, the way the payout above pays her out of the full price. A cancelled booking calls `reservation.release!`, and a reservation nobody captures falls off on its own after 3 days (see [Reserving value you are about to charge](#reserving-value-you-are-about-to-charge)).
 
 ### Loyalty programs & Reward points
 
@@ -994,12 +1040,34 @@ user.wallet(:points).debit(
 )
 ```
 
+Points from a purchase that can still be returned may stay pending until the return window closes. The member sees them, and redeems them once a return can no longer take them back:
+
+```ruby
+# 42 points for a $42.50 order, redeemable once the 30-day return window closes
+earned = user.wallet(:points).credit(
+  order.total_cents / 100,
+  category: :purchase,
+  available_at: 30.days.from_now,
+  metadata: { order_id: order.id }
+)
+
+user.wallet(:points).held_balance    # => 42, on the member's screen, not redeemable yet
+
+# Day 30, no return: the points are redeemable
+user.wallet(:points).held_balance    # => 0, the 42 points are in balance now
+
+# Or the order comes back inside the window: the pending points go with it
+user.wallet(:points).debit(earned.amount, category: :refund, from: earned, metadata: { order_id: order.id })
+earned.reload.remaining_amount       # => 0, and nothing else in the wallet was touched
+```
+
 **Loyalty-specific patterns:**
 
 | Pattern | Implementation |
 |---------|----------------|
 | **Tiered earning** | `credit(amount * tier_multiplier, ...)` |
 | **Points expiration** | `expires_at: 1.year.from_now` |
+| **Points pending until the return window closes** | `credit(..., available_at: 30.days.from_now)`, cancelled on a return with `from:` |
 | **Family pooling** | `transfer_to` family wallet |
 | **Gifting** | `transfer_to` friend's wallet |
 | **Earn + burn in one transaction** | `debit` points, `credit` new promo points |
@@ -1017,34 +1085,241 @@ user.wallet(:points).debit(
 
 ### Gig economy / Driver earnings
 
-An Uber/DoorDash-style app with earnings and tips:
+An Uber/DoorDash-style app with earnings and tips. A fare stays pending while the rider can still dispute it, and the weekly payout pays only what has cleared:
 
 ```ruby
 class Driver < ApplicationRecord
   has_wallets default_asset: :usd_cents
 end
 
-# Ride completed
+# Ride completed: the fare is pending for 3 days, while the rider can still dispute it
 driver.wallet(:usd_cents).credit(
   1250,  # $12.50 base fare
   category: :ride_fare,
+  available_at: 3.days.from_now,
   metadata: { ride_id: ride.id, distance_miles: 5.2 }
 )
 
 # Tip added later
-driver.wallet(:usd_cents).credit(
+tip = driver.wallet(:usd_cents).credit(
   300,  # $3.00 tip
   category: :tip,
   metadata: { ride_id: ride.id, rider_id: rider.id }
 )
 
-# Weekly payout
+# Weekly payout: `balance` is what has cleared, here the $3.00 tip
 driver.wallet(:usd_cents).debit(
   driver.wallet(:usd_cents).balance,
   category: :weekly_payout,
   metadata: { payout_date: Date.current, bank_account: "****1234" }
 )
+
+driver.wallet(:usd_cents).held_balance   # => 1250, paid out next week
 ```
+
+If the rider disputes the ride before the payout, retain the tip until support decides. The payout leaves it out, because it pays `balance`:
+
+```ruby
+dispute = driver.wallet(:usd_cents).hold(tip, category: :dispute, metadata: { ride_id: ride.id })
+driver.wallet(:usd_cents).balance   # => 0
+
+# Support sides with the driver: the tip is spendable again
+dispute.release!(reason: "resolved_for_driver")
+driver.wallet(:usd_cents).balance   # => 300
+
+# Or support sides with the rider: the tip goes back to them
+driver.wallet(:usd_cents).transfer_to(rider.wallet(:usd_cents), 300, category: :tip_refund, from: tip)
+```
+
+### Marketplace seller earnings
+
+An Etsy-style marketplace pays a seller when an order ships, but the buyer can still return it for 14 days. The earnings arrive held for that window, so the seller sees them but cannot cash out what a return could still take back:
+
+```ruby
+class Seller < ApplicationRecord
+  has_wallets default_asset: :eur_cents
+end
+
+# The order shipped: €45.00 of earnings, held until the return window closes
+earnings = seller.wallet(:eur_cents).credit(
+  4_500,
+  category: :sale,
+  hold: { category: :return_window, until: 14.days.from_now },
+  metadata: { order_id: order.id }
+)
+
+seller.wallet(:eur_cents).balance        # => 0
+seller.wallet(:eur_cents).held_balance   # => 4500
+
+# Day 14, no return: the earnings are available on their own
+seller.wallet(:eur_cents).balance        # => 4500
+```
+
+If the buyer returns the order inside the window, cancel the earnings. `from:` takes that sale's held value and never touches the seller's other money:
+
+```ruby
+seller.wallet(:eur_cents).debit(4_500, category: :refund, from: earnings, metadata: { order_id: order.id, reason: "returned" })
+```
+
+The earnings are a `credit` with `hold:` rather than a `transfer_to`, because a transfer cannot deliver its credits under a hold yet (see [Not in this release](#not-in-this-release)).
+
+### Bank-style accounts and fintech
+
+A neobank-style account reads like any bank statement: an **available** balance you can spend now, and a **current** balance that also counts what is still pending. In `wallets` they are `balance` and `total_balance`, and the table in [Holds and reservations](#holds-and-reservations) maps the rest.
+
+A day of activity on an account that starts with €500.00, and how it settles over the next few days:
+
+```ruby
+class Account < ApplicationRecord
+  has_wallets default_asset: :eur_cents
+end
+
+wallet = account.wallet(:eur_cents)   # €500.00, all of it available
+
+# Monday 08:00: the salary arrives. It clears tomorrow.
+wallet.credit(200_000, category: :deposit, available_at: 1.day.from_now)
+wallet.balance         # => 50000    available €500.00
+wallet.total_balance   # => 250000   current   €2,500.00
+
+# 09:00: the fuel pump pre-authorises €100.00 on the card
+fuel = wallet.reserve(10_000, category: :card_authorization, until: 7.days.from_now, metadata: { merchant: "Fuel station" })
+wallet.balance         # => 40000    available €400.00
+wallet.total_balance   # => 250000   current   €2,500.00
+
+# 09:05: the pump charges what was really filled, €62.40, and releases the rest
+fuel.capture!(6_240, category: :card_payment)
+wallet.balance         # => 43760    available €437.60
+wallet.total_balance   # => 243760   current   €2,437.60
+
+# 15:00: hotel check-in, a €150.00 hold for extras that the hotel never captures
+wallet.reserve(15_000, category: :card_authorization, until: 3.days.from_now, metadata: { merchant: "Hotel" })
+wallet.balance         # => 28760    available €287.60
+wallet.total_balance   # => 243760   current   €2,437.60
+
+# Tuesday 08:00: the salary has cleared
+wallet.balance         # => 228760   available €2,287.60
+wallet.total_balance   # => 243760   current   €2,437.60
+
+# Thursday 15:00: the hotel's hold has fallen off. Nothing is pending, so the two agree.
+wallet.balance         # => 243760   available €2,437.60
+wallet.total_balance   # => 243760   current   €2,437.60
+```
+
+This is the ledger behind the statement inside your app. Moving real money over bank rails, and the licences that come with holding it, stay with your banking partner (see [When NOT to use `wallets`](#when-not-to-use-wallets)).
+
+### Vesting rewards
+
+Value granted now that unlocks later. Vesting on a date is `available_at:`. Vesting on an event is a hold your app releases when the event happens. Either way the reward shows in `total_balance` from day one, and in `balance` once it may be spent. The three examples below are independent: each starts from an empty wallet.
+
+```ruby
+points = user.wallet(:points)
+
+# A referral bonus that unlocks in 14 days
+points.credit(500, category: :referral, available_at: 14.days.from_now)
+
+points.balance         # => 0
+points.held_balance    # => 500
+points.total_balance   # => 500
+
+# 14 days later
+points.balance         # => 500
+```
+
+A reward that vests on a schedule is one credit per step, each with its own date:
+
+```ruby
+# A creator reward of 1,200 points that vests 400 a month for three months
+[1, 2, 3].each do |month|
+  points.credit(400, category: :creator_reward, available_at: month.months.from_now)
+end
+
+points.balance         # => 0
+points.held_balance    # => 1200
+
+# Two months later
+points.balance         # => 800
+points.held_balance    # => 400
+```
+
+A bonus that vests on an event arrives held, and your app releases the hold when the event happens:
+
+```ruby
+# A signup bonus that vests when the member completes their first order
+bonus = points.credit(1_000, category: :signup_bonus, hold: :first_order_pending)
+
+points.balance         # => 0
+points.total_balance   # => 1000
+
+# The first order is completed
+bonus.holds.find_by(category: :first_order_pending).release!(reason: "first_order_completed")
+points.balance         # => 1000
+```
+
+If the condition is never met, take the bonus back with `from:` (see [Ending a hold by taking the value](#ending-a-hold-by-taking-the-value)).
+
+### Retained rewards and reviews
+
+Some value is the user's the moment it is earned, yet the platform keeps it back until something outside the app happens: a partner programme reimburses the reward months later, or a fraud or compliance review clears. Credit it now and retain it with a hold. Every retention then ends one of two ways: `release!` gives the value to the user, and `debit` or `transfer_to` with `from:` takes it away (see [Holds and reservations](#holds-and-reservations) for the mechanics).
+
+```ruby
+wallet = user.wallet(:eur_cents)
+
+# A €15.00 reward earned today, which a partner programme reimburses months from now
+reward = wallet.credit(
+  1_500,
+  category: :reward,
+  hold: { category: :awaiting_reimbursement, metadata: { programme: "partner_cashback", claim_id: 88 } }
+)
+
+wallet.balance         # => 0, not spendable yet
+wallet.total_balance   # => 1500, but already the user's
+
+# The programme pays: give the reward to the user
+reward.holds.find_by(category: :awaiting_reimbursement).release!(reason: "reimbursed")
+wallet.balance         # => 1500
+
+# Or the programme rejects the claim: take the reward back
+wallet.debit(1_500, category: :reversal, from: reward, metadata: { reason: "claim_rejected" })
+wallet.total_balance   # => 0
+```
+
+A review retains as much as it needs: one credit, several, or the whole account. Keep the holds it places, so the review can later end exactly those:
+
+```ruby
+# One credit
+wallet.hold(reward, category: :fraud_review, metadata: { case_id: 42 })
+
+# Several credits, such as the rewards from a batch of suspicious referrals
+review = suspicious_rewards.map do |credit|
+  wallet.hold(credit, category: :fraud_review, metadata: { case_id: 42 })
+end
+
+# The whole account, credits that arrive during the review included
+account_review = wallet.hold(category: :compliance_review, metadata: { case_id: 43 })
+```
+
+To tell the user why their money is pending, read the reasons. A credit lists its own holds, and a hold on the whole account answers `wallet.on_hold?`. Map each category to your own words, such as "Pending until our partner pays" or "Under review":
+
+```ruby
+# A reward still awaiting reimbursement, now under fraud review too
+reward.held?                                     # => true
+reward.holds.active.order(:id).map(&:category)   # => ["awaiting_reimbursement", "fraud_review"]
+wallet.on_hold?                                  # => true, the compliance review covers the whole account
+```
+
+End the review with the holds it placed. Cleared, they are released together. Confirmed, the value is taken, here into the platform's wallet; `from:` takes value and leaves every hold row where it is, so the account hold is released by hand once the value is gone:
+
+```ruby
+# Cleared: release exactly the holds this review placed
+wallet.with_lock { review.each { |hold| hold.release!(reason: "cleared") } }
+account_review.release!(reason: "cleared")
+
+# Or confirmed: move the retained value to the platform, then end the account hold
+wallet.transfer_to(platform.wallet(:eur_cents), suspicious_rewards.sum(&:remaining_amount), category: :reversal, from: suspicious_rewards)
+account_review.release!(reason: "confirmed")
+```
+
+A hold keeps value from being spent, and nothing more. If withdrawals must stop during a review, check `wallet.on_hold?` or the credit's holds in your app before allowing one (see [How holds change the rules you already know](#how-holds-change-the-rules-you-already-know)).
 
 ## Perfect use cases
 
@@ -1053,10 +1328,12 @@ driver.wallet(:usd_cents).debit(
 | Use case | Example | Why `wallets` fits |
 |----------|---------|-------------------|
 | **Telecom / data plans** | Mobile data that users can share | Multi-asset (`:data_mb`, `:sms`, `:minutes`), transfers, expiration |
-| **Game economies** | FarmVille, Fortnite, OGame | Multiple resources, trading between players |
-| **Marketplaces** | Etsy, Fiverr, Airbnb | Seller earnings, buyer credits, platform settlements |
-| **Rewards / loyalty** | Sweatcoin, credit card points | Points from actions, expiring promos, redemptions |
-| **Gig economy** | Uber, DoorDash | Driver earnings, tips, scheduled payouts |
+| **Game economies** | FarmVille, Fortnite, OGame | Multiple resources, trading between players, prizes held during an anti-cheat review |
+| **Marketplaces** | Etsy, Fiverr, Airbnb | Seller earnings held through the return window, buyer credits, platform settlements |
+| **Escrow-style bookings** | Home cleaning, repairs, rentals | The price reserved at booking, the real cost captured at delivery, unclaimed reservations falling off |
+| **Rewards / loyalty** | Sweatcoin, credit card points | Points from actions, bonuses that vest, rewards retained until a partner pays, expiring promos, redemptions |
+| **Gig economy** | Uber, DoorDash | Driver earnings that clear before the payout, tips retained during a dispute, scheduled payouts |
+| **Fintech-style accounts** | Neobank-style apps, prepaid and expense cards | Available and current balances, pending deposits, card pre-authorisations, all inside your app |
 | **Multi-currency** | Travel apps, international platforms | Per-currency wallets (`:eur`, `:usd`, `:gbp`) |
 | **Store credit** | Gift cards, refund credits | Simple balance with full audit trail |
 
@@ -1064,6 +1341,7 @@ driver.wallet(:usd_cents).debit(
 - Users hold **multiple types of value** (not just one "credits" balance)
 - Users **transfer value to each other** (gifts, trades, P2P payments)
 - Value **expires** (promotional credits, seasonal currencies, data rollovers)
+- Value must **exist before it may be spent** (pending deposits, bonuses that vest, earnings in a return window, a booking price set aside)
 - You need a **full audit trail** (not just a cached integer)
 - The app is the **source of truth** (not syncing with external ledgers)
 
