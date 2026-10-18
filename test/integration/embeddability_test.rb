@@ -140,7 +140,7 @@ class EmbeddabilityTest < ActiveSupport::TestCase
     end
 
     def json_column_type(connection)
-      connection.adapter_name.downcase.include?("postgresql") ? :jsonb : :json
+      connection.adapter_name.match?(/postg/i) ? :jsonb : :json
     end
 
     def json_column_default(connection)

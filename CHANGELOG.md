@@ -1,3 +1,9 @@
+## [0.4.3] - Unreleased
+
+### Fixed
+
+- The install and upgrade migrations pick `jsonb` for the metadata columns on PostgreSQL under either of its adapter names: `PostGIS` (activerecord-postgis-adapter) was getting plain `json`. Found while moving CarHey to 0.4.2.
+
 ## [0.4.2] - 2026-10-18
 
 ### Fixed

@@ -109,6 +109,20 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
     end
   end
 
+  test "both migrations pick jsonb on PostgreSQL under either of its adapter names" do
+    # PostGIS is PostgreSQL under another name (activerecord-postgis-adapter);
+    # it was getting plain json metadata columns while PostgreSQL got jsonb.
+    Wallets.configuration.table_prefix = "upggen_"
+    run_generator
+
+    [install_migration, upgrade_migration].each do |migration|
+      {"PostgreSQL" => :jsonb, "PostGIS" => :jsonb, "Mysql2" => :json, "Trilogy" => :json, "SQLite" => :json}.each do |adapter, type|
+        migration.stubs(:connection).returns(stub(adapter_name: adapter))
+        assert_equal type, migration.send(:json_column_type), "#{adapter} metadata columns"
+      end
+    end
+  end
+
   test "both migrations recognise MySQL under Rails' Trilogy adapter" do
     # Trilogy reports its own adapter name, and MySQL refuses a default on a
     # JSON column whichever adapter asks. The bundle has no trilogy gem, so
