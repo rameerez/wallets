@@ -66,6 +66,25 @@ module Wallets
     ARRIVAL_HOLD_OPTIONS = %i[category until metadata].freeze
     private_constant :ARRIVAL_HOLD_OPTIONS
 
+    # The columns the ledger itself writes on the wallet row
+    # (`refresh_cached_balance!`); the caller never sets them.
+    LEDGER_WRITTEN_COLUMNS = %w[balance ledger_revision updated_at].freeze
+    private_constant :LEDGER_WRITTEN_COLUMNS
+
+    # Every command starts by locking the wallet row, and Rails refuses to
+    # lock a record with unsaved changes. A rolled-back command leaves
+    # exactly that behind: the cached balance, the revision and `updated_at`
+    # it had written stay in memory, marked as unsaved changes, once its
+    # savepoint or the caller's transaction is rolled back, and the next
+    # command on the same instance would raise. Those columns are the
+    # ledger's, not the caller's, and the lock reads the row again anyway,
+    # so they are discarded first. A change to any other attribute is the
+    # caller's, and Rails' refusal stands.
+    def lock!(lock = true)
+      restore_attributes(changed & LEDGER_WRITTEN_COLUMNS) if persisted?
+      super
+    end
+
     self.table_suffix = "wallets"
 
     # =========================================
@@ -1642,12 +1661,13 @@ module Wallets
     # the balance did not move, because `touch` writes nothing under
     # `no_touching`.
     #
-    # `update!` rather than assigning and then saving: if the command's
-    # savepoint rolls back afterwards, Active Record leaves the wallet with no
-    # pending changes, so its next command can lock it. It is clean, not
-    # restored: it keeps the rolled-back values in memory until that lock
-    # reloads the row. Assigning first would leave them pending instead, and
-    # no later command could lock the wallet.
+    # `update!` rather than assigning and then saving, so nothing sits pending
+    # between commands. A rollback can still leave these columns pending:
+    # once the real transaction, or a savepoint the caller opened, rolls
+    # back, Active Record restores the values this write left in memory as
+    # unsaved changes. `lock!` discards exactly those (LEDGER_WRITTEN_COLUMNS)
+    # before locking, so the next command can lock the wallet and reads the
+    # row again.
     def refresh_cached_balance!
       available = current_balance
 

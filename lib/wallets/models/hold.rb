@@ -124,6 +124,22 @@ module Wallets
     # nothing. Why it ended is recorded next to why it began, never over it.
     #
     #   hold.release!(reason: "cleared_by_operator", metadata: {actor_id: operator.id})
+    # The columns a release or a capture writes on the hold row; the caller
+    # never sets them after the hold is placed.
+    COMMAND_WRITTEN_COLUMNS = %w[released_at release_reason release_metadata capture_transaction_id updated_at].freeze
+    private_constant :COMMAND_WRITTEN_COLUMNS
+
+    # A release or a capture locks the hold row, and Rails refuses to lock a
+    # record with unsaved changes: a rolled-back release or capture leaves
+    # what it wrote in memory as unsaved changes, so retrying it on the same
+    # instance would raise. Those columns are the command's, and the lock
+    # reads the row again, so they are discarded first (see
+    # `Wallets::WalletBase#lock!`).
+    def lock!(lock = true)
+      restore_attributes(changed & COMMAND_WRITTEN_COLUMNS) if persisted?
+      super
+    end
+
     def release!(reason: nil, metadata: {})
       raise InvalidHold, "Only a saved hold can be released" unless persisted?
 
