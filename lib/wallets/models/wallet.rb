@@ -1661,12 +1661,13 @@ module Wallets
     # the balance did not move, because `touch` writes nothing under
     # `no_touching`.
     #
-    # `update!` rather than assigning and then saving: if the command's
-    # savepoint rolls back afterwards, Active Record leaves the wallet with no
-    # pending changes, so its next command can lock it. It is clean, not
-    # restored: it keeps the rolled-back values in memory until that lock
-    # reloads the row. Assigning first would leave them pending instead, and
-    # no later command could lock the wallet.
+    # `update!` rather than assigning and then saving, so nothing sits pending
+    # between commands. A rollback can still leave these columns pending:
+    # once the real transaction, or a savepoint the caller opened, rolls
+    # back, Active Record restores the values this write left in memory as
+    # unsaved changes. `lock!` discards exactly those (LEDGER_WRITTEN_COLUMNS)
+    # before locking, so the next command can lock the wallet and reads the
+    # row again.
     def refresh_cached_balance!
       available = current_balance
 

@@ -34,7 +34,7 @@ class RolledBackCommandTest < ActiveSupport::TestCase
     end
 
     assert_equal 100, @wallet.balance
-    assert_equal 100, @wallet.reload.read_attribute(:balance)
+    assert_equal 100, Wallets::Wallet.find(@wallet.id).read_attribute(:balance), "read through another instance: a reload here would clear the very state under test"
     debit = @wallet.debit(10, category: :purchase)
     assert_equal(-10, debit.amount)
     assert_equal 90, @wallet.read_attribute(:balance), "the cached balance is written again"
@@ -95,7 +95,7 @@ class RolledBackCommandTest < ActiveSupport::TestCase
         raise "rolled back"
       }
     }
-    assert hold.reload.active?
+    assert Wallets::Hold.find(hold.id).active?, "read through another instance, so the retry runs on the dirty one"
 
     hold.release!(reason: "second try")
     assert_equal "second try", hold.reload.release_reason
@@ -110,7 +110,7 @@ class RolledBackCommandTest < ActiveSupport::TestCase
         raise "rolled back"
       }
     }
-    assert reservation.reload.active?
+    assert Wallets::Hold.find(reservation.id).active?, "read through another instance, so the retry runs on the dirty one"
 
     debit = reservation.capture!(40, category: :purchase)
     assert_equal(-40, debit.amount)
@@ -125,6 +125,16 @@ class RolledBackCommandTest < ActiveSupport::TestCase
     assert_match(/unpersisted changes/, error.message)
     assert_match(/"metadata"/, error.message)
   end
+  test "the caller's own unsaved change on a hold is still refused by the lock" do
+    hold = @wallet.hold(@wallet.transactions.credits.sole, category: :fraud_review)
+    hold.metadata = {"note" => "unsaved"}
+
+    error = assert_raises(RuntimeError) { hold.release!(reason: "cleared") }
+    assert_match(/unpersisted changes/, error.message)
+    assert_match(/"metadata"/, error.message)
+    assert Wallets::Hold.find(hold.id).active?
+  end
+
   test "locking an unsaved wallet or hold is a no-op, as in Rails" do
     wallet = Wallets::Wallet.new(owner: @owner, asset_code: :unsaved, balance: 5)
     assert_same wallet, wallet.lock!
