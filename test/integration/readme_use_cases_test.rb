@@ -38,11 +38,10 @@ class ReadmeUseCasesTest < ActiveSupport::TestCase
       hold: {category: :anti_cheat_review, metadata: {match_id: 314}}
     )
 
-    assert_equal 0, player.wallet(:gems).balance
-    assert_equal 1_000, player.wallet(:gems).total_balance
+    assert_equal [0, 1_000, 1_000], balances(player.wallet(:gems))
 
     prize.holds.find_by(category: :anti_cheat_review).release!(reason: "match_clean")
-    assert_equal 1_000, player.wallet(:gems).balance
+    assert_equal [1_000, 0, 1_000], balances(player.wallet(:gems))
   end
 
   test "game economy: a prize is taken back when cheating is confirmed" do
@@ -119,10 +118,9 @@ class ReadmeUseCasesTest < ActiveSupport::TestCase
     )
 
     assert earned.held?
-    assert_equal 0, user.wallet(:points).balance
-    assert_equal 42, user.wallet(:points).total_balance
+    assert_equal [0, 42, 42], balances(user.wallet(:points))
 
-    travel_to(30.days.from_now) { assert_equal 42, user.wallet(:points).balance }
+    travel_to(30.days.from_now) { assert_equal [42, 0, 42], balances(user.wallet(:points)) }
   end
 
   test "loyalty: a returned order takes its pending points with it" do
@@ -130,9 +128,13 @@ class ReadmeUseCasesTest < ActiveSupport::TestCase
     order = Struct.new(:id, :total_cents).new(77, 4_250)
     earned = user.wallet(:points).credit(order.total_cents / 100, category: :purchase, available_at: 30.days.from_now, metadata: {order_id: order.id})
 
+    other = user.wallet(:points).credit(10, category: :purchase)
+
     user.wallet(:points).debit(earned.amount, category: :refund, from: earned, metadata: {order_id: order.id})
 
-    assert_equal 0, user.wallet(:points).total_balance
+    assert_equal 0, earned.reload.remaining_amount
+    assert_equal 10, other.reload.remaining_amount, "nothing else in the wallet was touched"
+    assert_equal [10, 0, 10], balances(user.wallet(:points))
   end
 
   # ───────────────────────────────────────────────────────────────────────────
@@ -382,9 +384,7 @@ class ReadmeUseCasesTest < ActiveSupport::TestCase
     wallet.hold(category: :compliance_review, metadata: {case_id: 43})
 
     assert reward.held?
-    # Sorted only so no database's row order can fail it; the README's order
-    # is the order the holds were placed in.
-    assert_equal ["awaiting_reimbursement", "fraud_review"], reward.holds.active.map(&:category).sort
+    assert_equal ["awaiting_reimbursement", "fraud_review"], reward.holds.active.order(:id).map(&:category)
     assert wallet.on_hold?
   end
 
@@ -409,12 +409,17 @@ class ReadmeUseCasesTest < ActiveSupport::TestCase
     platform = @other
     wallet = @user.wallet(:eur_cents)
     suspicious_rewards = [wallet.credit(500, category: :reward), wallet.credit(700, category: :reward)]
-    suspicious_rewards.each { |credit| wallet.hold(credit, category: :fraud_review, metadata: {case_id: 42}) }
+    review = suspicious_rewards.map { |credit| wallet.hold(credit, category: :fraud_review, metadata: {case_id: 42}) }
+    account_review = wallet.hold(category: :compliance_review, metadata: {case_id: 43})
 
     wallet.transfer_to(platform.wallet(:eur_cents), suspicious_rewards.sum(&:remaining_amount), category: :reversal, from: suspicious_rewards)
+    account_review.release!(reason: "confirmed")
 
     assert_equal [0, 0, 0], balances(wallet)
     assert_equal 1_200, platform.wallet(:eur_cents).balance
+    assert review.all? { |hold| hold.reload.active? }, "from: leaves the credits' hold rows where they are"
+    refute wallet.on_hold?, "the account hold was ended by hand"
+    assert_equal 300, wallet.credit(300, category: :reward).available_amount, "so later credits arrive spendable"
   end
 
   private

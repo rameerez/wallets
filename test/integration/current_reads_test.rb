@@ -556,6 +556,48 @@ class CurrentReadsTest < ActiveSupport::TestCase
     assert_equal "first", hold.reload.release_reason
   end
 
+  test "a capture after a stale read finds the reservation already released and creates nothing" do
+    reservation = @wallet.reserve(60, category: :booking)
+    debited = Queue.new
+    released = Queue.new
+    Wallets.configuration.on_balance_debited { |context| debited << context.transaction.id }
+    Wallets.configuration.on_hold_released { |context| released << [context.hold.release_reason, context.transaction&.id] }
+
+    outcome = after_a_stale_read(-> { Wallets::Hold.find(reservation.id).release!(reason: "cancelled") }) do
+      Wallets::Hold.find(reservation.id).capture!(category: :purchase) # active, as this snapshot saw it
+    rescue Wallets::InvalidHold => error
+      error
+    end
+
+    assert_kind_of Wallets::InvalidHold, outcome
+    assert_empty drain(debited)
+    assert_equal [["cancelled", nil]], drain(released), "the release reported itself; the late capture reports nothing"
+    assert_equal "cancelled", reservation.reload.release_reason
+    refute reservation.captured?
+    assert_empty @wallet.transactions.debits
+    assert_equal 100, @wallet.balance
+  end
+
+  test "a release after a stale read finds the reservation already captured and reports nothing" do
+    reservation = @wallet.reserve(60, category: :booking)
+    debited = Queue.new
+    released = Queue.new
+    Wallets.configuration.on_balance_debited { |context| debited << context.transaction.id }
+    Wallets.configuration.on_hold_released { |context| released << [context.hold.release_reason, context.transaction&.id] }
+    capture = nil
+
+    outcome = after_a_stale_read(-> { capture = Wallets::Hold.find(reservation.id).capture!(category: :purchase) }) do
+      Wallets::Hold.find(reservation.id).release!(reason: "cancelled") # active, as this snapshot saw it
+    end
+
+    assert_equal "captured", outcome.release_reason, "the late release finds the capture"
+    assert_equal capture.id, outcome.capture_transaction_id
+    assert_equal [capture.id], drain(debited)
+    assert_equal [["captured", capture.id]], drain(released), "the capture reported its release; the late release reports nothing"
+    assert_equal [capture.id], @wallet.transactions.debits.pluck(:id)
+    assert_equal 40, @wallet.balance
+  end
+
   test "a capture and a release racing for one reservation settle on one terminal transition" do
     debited = Queue.new
     released = Queue.new
@@ -654,6 +696,18 @@ class CurrentReadsTest < ActiveSupport::TestCase
     assert_equal "Stopped waiting for an answer: the other side gave up", error.message
   end
 
+  test "a race whose racer fails before it is ready fails at once with that error, and leaves nothing behind" do
+    pool = ActiveRecord::Base.connection_pool
+    pool.stubs(:with_connection).raises(ActiveRecord::ConnectionTimeoutError, "no connection for the racer")
+
+    error = assert_race_fails_cleanly(ActiveRecord::ConnectionTimeoutError, "before the racer is ready") do
+      all_at_once([1]) { flunk "a racer that never got ready must never run" }
+    end
+    assert_equal "no connection for the racer", error.message
+  ensure
+    pool.unstub(:with_connection) # `transaction` goes through it too, teardown included
+  end
+
   test "every racer holds a connection of its own before any of them starts" do
     # The first racer to start finds every racer's connection checked out:
     # none can finish, and give its connection back, before another has one.
@@ -663,7 +717,7 @@ class CurrentReadsTest < ActiveSupport::TestCase
 
     all_at_once(Array.new(concurrency) { |i| i }) { seen_at_start << pool.stat[:busy] }
 
-    assert_equal checked_out + concurrency, seen_at_start.pop
+    assert_equal checked_out + concurrency, await(seen_at_start, "the first racer's count")
   end
 
   private
@@ -746,17 +800,26 @@ class CurrentReadsTest < ActiveSupport::TestCase
   # Runs the block once per item, each on a thread and a connection of its
   # own, and starts them all at the same moment: every racer checks out its
   # connection and reports ready before any is let go, so none can finish
-  # before another has even begun. Returns each block's result, or the
-  # error it raised.
+  # before another has even begun. Racers are spawned one at a time, each
+  # ready before the next starts (two threads registering a connection at
+  # once trip the thread map Rails 8.1.3 falls back to on Ruby below
+  # 3.3.5), and a racer that fails before it is ready fails the race at
+  # once. Returns each block's result, or the error it raised.
   def all_at_once(items)
+    pool = ActiveRecord::Base.connection_pool
+    flunk("#{items.size} racers and the test need #{items.size + 1} connections, and the pool has #{pool.size}") if items.size + 1 > pool.size
+
     ready = Queue.new
     start = Queue.new
+    racers = []
 
-    racers = items.map do |item|
-      Thread.new do
+    connections = items.map do |item|
+      racers << Thread.new do
         Thread.current.report_on_exception = false # the test raises what a racer ended with
-        ActiveRecord::Base.connection_pool.with_connection do |connection|
+        reported = false
+        pool.with_connection do |connection|
           ready << connection
+          reported = true
           await(start, "the start")
           begin
             yield item
@@ -764,16 +827,18 @@ class CurrentReadsTest < ActiveSupport::TestCase
             error
           end
         end
+      ensure
+        ready.close unless reported # wakes the test should the racer fail before it is ready
       end
+      await(ready, "the racer's connection", from: racers.last)
     end
 
-    connections = Array.new(racers.size) { await(ready, "every racer's connection", from: racers) }
     assert_equal connections.size, connections.uniq.size, "every racer runs on a connection of its own"
     refute_includes connections, ActiveRecord::Base.connection, "and none on the test's"
     racers.size.times { start << true }
     racers.map { |racer| finish(racer) }
   ensure
-    start.close # racers still waiting give up
+    start&.close # racers still waiting give up
     settle(racers)
   end
 

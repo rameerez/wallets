@@ -830,12 +830,11 @@ prize = player.wallet(:gems).credit(
   hold: { category: :anti_cheat_review, metadata: { match_id: 314 } }
 )
 
-player.wallet(:gems).balance         # => 0
-player.wallet(:gems).total_balance   # => 1000
+player.wallet(:gems).held_balance    # => 1000, on the player's screen, not spendable yet
 
 # The match is clean: the gems are the player's to spend
 prize.holds.find_by(category: :anti_cheat_review).release!(reason: "match_clean")
-player.wallet(:gems).balance         # => 1000
+player.wallet(:gems).held_balance    # => 0, the 1,000 gems are in balance now
 
 # Or cheating is confirmed: the prize is taken back instead
 player.wallet(:gems).debit(1_000, category: :prize_revoked, from: prize)
@@ -921,7 +920,7 @@ sara.wallet(:usd_cents).balance        # => 4250
 sara.wallet(:usd_cents).held_balance   # => 0
 ```
 
-A capture is a debit, like a card charge, so the marketplace's credit is written next to it in one database transaction. From there the marketplace pays Lucia as above. A cancelled booking calls `reservation.release!`, and a reservation nobody captures falls off on its own after 3 days (see [Reserving value you are about to charge](#reserving-value-you-are-about-to-charge)).
+A capture is a debit, like a card charge, so the marketplace's credit is written next to it in one database transaction. From there the marketplace keeps its fee and pays Lucia out of the 3,750, the way the payout above pays her out of the full price. A cancelled booking calls `reservation.release!`, and a reservation nobody captures falls off on its own after 3 days (see [Reserving value you are about to charge](#reserving-value-you-are-about-to-charge)).
 
 ### Loyalty programs & Reward points
 
@@ -1052,15 +1051,14 @@ earned = user.wallet(:points).credit(
   metadata: { order_id: order.id }
 )
 
-user.wallet(:points).balance         # => 0
-user.wallet(:points).total_balance   # => 42
+user.wallet(:points).held_balance    # => 42, on the member's screen, not redeemable yet
 
 # Day 30, no return: the points are redeemable
-user.wallet(:points).balance         # => 42
+user.wallet(:points).held_balance    # => 0, the 42 points are in balance now
 
 # Or the order comes back inside the window: the pending points go with it
 user.wallet(:points).debit(earned.amount, category: :refund, from: earned, metadata: { order_id: order.id })
-user.wallet(:points).total_balance   # => 0
+earned.reload.remaining_amount       # => 0, and nothing else in the wallet was touched
 ```
 
 **Loyalty-specific patterns:**
@@ -1211,7 +1209,7 @@ This is the ledger behind the statement inside your app. Moving real money over 
 
 ### Vesting rewards
 
-Value granted now that unlocks later. Vesting on a date is `available_at:`. Vesting on an event is a hold your app releases when the event happens. Either way the reward shows in `total_balance` from day one, and in `balance` once it may be spent:
+Value granted now that unlocks later. Vesting on a date is `available_at:`. Vesting on an event is a hold your app releases when the event happens. Either way the reward shows in `total_balance` from day one, and in `balance` once it may be spent. The three examples below are independent: each starts from an empty wallet.
 
 ```ruby
 points = user.wallet(:points)
@@ -1304,20 +1302,21 @@ To tell the user why their money is pending, read the reasons. A credit lists it
 
 ```ruby
 # A reward still awaiting reimbursement, now under fraud review too
-reward.held?                          # => true
-reward.holds.active.map(&:category)   # => ["awaiting_reimbursement", "fraud_review"]
-wallet.on_hold?                       # => true, the compliance review covers the whole account
+reward.held?                                     # => true
+reward.holds.active.order(:id).map(&:category)   # => ["awaiting_reimbursement", "fraud_review"]
+wallet.on_hold?                                  # => true, the compliance review covers the whole account
 ```
 
-End the review with the holds it placed. Cleared, they are released together. Confirmed, the value is taken, here into the platform's wallet:
+End the review with the holds it placed. Cleared, they are released together. Confirmed, the value is taken, here into the platform's wallet; `from:` takes value and leaves every hold row where it is, so the account hold is released by hand once the value is gone:
 
 ```ruby
 # Cleared: release exactly the holds this review placed
 wallet.with_lock { review.each { |hold| hold.release!(reason: "cleared") } }
 account_review.release!(reason: "cleared")
 
-# Or confirmed: move the retained value to the platform
+# Or confirmed: move the retained value to the platform, then end the account hold
 wallet.transfer_to(platform.wallet(:eur_cents), suspicious_rewards.sum(&:remaining_amount), category: :reversal, from: suspicious_rewards)
+account_review.release!(reason: "confirmed")
 ```
 
 A hold keeps value from being spent, and nothing more. If withdrawals must stop during a review, check `wallet.on_hold?` or the credit's holds in your app before allowing one (see [How holds change the rules you already know](#how-holds-change-the-rules-you-already-know)).
