@@ -1,3 +1,9 @@
+## [0.4.2] - Unreleased
+
+### Fixed
+
+- **A rolled-back command no longer poisons the wallet or hold instance it wrote.** Every command starts by locking its row, and Rails refuses to lock a record with unsaved changes. When a command's savepoint or the caller's transaction was rolled back after the command had written the row (a block that spends inside a command and is then refused, a `transaction { wallet.debit(...); raise }` the caller rescues), Rails kept the cached `balance`, `ledger_revision` and `updated_at` the command had written in memory as unsaved changes, and the next command on the same wallet instance raised `RuntimeError: Locking a record with unpersisted changes is not supported` instead of running; a rolled-back release or capture did the same to its hold. The columns a command writes are the ledger's, not the caller's, and the lock reads the row again anyway, so `lock!` discards them first. A change the caller made to any other attribute is still refused, as Rails intends. Found by installing usage_credits 1.0.0 into a fresh app; its `spend_credits_on` is the first shape.
+
 ## [0.4.1] - 2026-10-18
 
 ### Documentation
