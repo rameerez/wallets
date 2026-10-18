@@ -387,28 +387,29 @@ class Wallets::TransferTest < ActiveSupport::TestCase
     assert sender.has_enough_balance?(10)
   end
 
-  test "concurrent overdraft transfers serialize through the wallet pair lock" do
-    # `lock_wallet_pair!` already serialized concurrent transfers under the
-    # positive-balance contract. With overdraft the lock matters more, not
-    # less — two threads scanning a QR shouldn't double-debit a passenger
-    # whose remaining headroom only covers one transfer. Verify the lock
-    # is still acquired before the balance read used by the transfer.
-    Wallets.configuration.allow_negative_balance = true
-    sender = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 0)
-    recipient = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 0)
+  test "a transfer locks both wallets in id order, whichever way it goes, before it reads a balance" do
+    # Two opposing transfers that each locked their own sender first could
+    # each hold one row while waiting for the other: a deadlock. Locking the
+    # smaller id first gives every transfer between two wallets one order.
+    # CurrentReadsTest races such transfers on real connections.
+    skip "SQLite takes no row locks: it serializes writers for the whole database" if sqlite?
 
-    lock_calls = 0
-    sender.singleton_class.send(:define_method, :lock_wallet_pair!) do |other|
-      lock_calls += 1
-      first, second = [self, other].sort_by(&:id)
-      first.lock!
-      second.lock! unless first.id == second.id
+    first = create_wallet(users(:new_user), asset_code: :credits, initial_balance: 100)
+    second = create_wallet(users(:peer_user), asset_code: :credits, initial_balance: 100)
+    assert_operator first.id, :<, second.id
+
+    {"forward" => [first, second], "backward" => [second, first]}.each do |direction, (from, to)|
+      # Unprepared, each statement names its row; prepared, PostgreSQL would
+      # show only `$1`.
+      statements = Wallets::Wallet.connection.unprepared_statement do
+        capture_sql { from.transfer_to(to, 10, category: :peer_payment) }
+      end
+      before_any_balance_read = statements.take_while { |sql| !sql.match?(/COALESCE\(SUM\(CASE WHEN/) }
+
+      assert_operator before_any_balance_read.size, :<, statements.size, "#{direction}: the transfer reads a balance"
+      assert_equal [first.id, second.id], locked_wallet_ids(statements), "#{direction}: the smaller id first, each row once"
+      assert_equal [first.id, second.id], locked_wallet_ids(before_any_balance_read), "#{direction}: both rows before any balance"
     end
-
-    sender.transfer_to(recipient, 25, category: :peer_payment)
-
-    assert_equal 1, lock_calls
-    assert_equal(-25, sender.reload.balance)
   end
 
   test "rejects transfers across different assets" do
@@ -616,31 +617,14 @@ class Wallets::TransferTest < ActiveSupport::TestCase
     assert Wallets::Transfer.find(transfer.id).metadata[:flagged]
   end
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # Concurrency
-  # ───────────────────────────────────────────────────────────────────────────
+  private
 
-  test "simultaneous opposing transfers serialize without deadlocking" do
-    # `lock_wallet_pair!` always locks the wallet with the smaller id first,
-    # so two opposing transfers (A→B and B→A) can never each hold one lock
-    # while waiting on the other.
-    alice = create_wallet(users(:new_user), asset_code: :duel, initial_balance: 100)
-    bob = create_wallet(users(:peer_user), asset_code: :duel, initial_balance: 100)
+  def sqlite?
+    Wallets::Wallet.connection.adapter_name.match?(/sqlite/i)
+  end
 
-    start_line = Queue.new
-    threads = [[alice, bob], [bob, alice]].map do |from, to|
-      Thread.new do
-        ActiveRecord::Base.connection_pool.with_connection do
-          start_line.pop
-          from.class.find(from.id).transfer_to(to.class.find(to.id), 10, category: :peer_payment)
-        end
-      end
-    end
-    2.times { start_line << true }
-    threads.each(&:join)
-
-    assert_equal 100, alice.reload.balance
-    assert_equal 100, bob.reload.balance
-    assert_equal 2, Wallets::Transfer.where(from_wallet_id: [alice.id, bob.id]).count
+  # The wallet rows the statements lock, in the order they lock them.
+  def locked_wallet_ids(statements)
+    statements.filter_map { |sql| sql[/\ASELECT .?wallets_wallets.?\.\* FROM .?wallets_wallets.? WHERE .?wallets_wallets.?\..?id.? = (\d+) .*FOR UPDATE/, 1]&.to_i }
   end
 end

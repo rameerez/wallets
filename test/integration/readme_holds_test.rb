@@ -280,6 +280,44 @@ class ReadmeHoldsTest < ActiveSupport::TestCase
     travel_to(14.days.from_now) { assert_equal 5_000, seller_wallet.balance }
   end
 
+  # ───────────────────────────────────────────────────────────────────────────
+  # Why this gem, and Upgrading an existing install
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "holds change what is available through hold rows, and only a capture posts a transaction" do
+    wallet = new_wallet(100)
+    credit = wallet.transactions.credits.sole
+
+    assert_no_difference -> { wallet.transactions.count } do
+      hold = wallet.hold(credit, category: :fraud_review)
+      assert_equal 0, wallet.balance, "the available balance moved"
+      hold.release!
+      wallet.reserve(30, category: :booking).release!
+    end
+    assert_equal 2, wallet.holds.count, "each change is a hold row"
+
+    reservation = wallet.reserve(30, category: :booking)
+    assert_difference -> { wallet.transactions.debits.count }, 1 do
+      reservation.capture!(category: :booking_charge)
+    end
+  end
+
+  test "the cached balance column stores the available balance, so it is reconciled with balance" do
+    freeze_time
+    wallet = new_wallet(100)
+
+    wallet.reserve(30, category: :booking, until: 1.day.from_now)
+
+    assert_equal 70, wallet.reload.read_attribute(:balance)
+    assert_equal 70, wallet.balance
+    assert_equal 100, wallet.total_balance
+
+    travel_to(1.day.from_now) do
+      assert_equal 70, wallet.reload.read_attribute(:balance), "time alone moves nothing in the column"
+      assert_equal 100, wallet.balance, "the reservation lapsed"
+    end
+  end
+
   private
 
   def new_wallet(initial_balance = 0)

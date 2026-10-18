@@ -10,12 +10,23 @@ require "test_helper"
 # to prove it, and prove the converse too: commands whose snapshot is current
 # take no extra locks, because extra InnoDB gap locks deadlock unrelated
 # wallets. The hold commands race here too: against debits on the same
-# credit, and against each other on one hold. PostgreSQL reads current rows
-# per statement and runs every test as well. SQLite serializes writers for the
-# whole database, so none of these interleavings can exist there.
+# credit, and against each other on one hold. So do plain debits and
+# transfers, to prove the row locks serialize them without deadlocks.
+# PostgreSQL reads current rows per statement and runs every test as well.
+# SQLite serializes writers for the whole database, so none of these
+# interleavings can exist there.
+#
+# Every racer runs on a connection of its own, and every wait is bounded: a
+# race that goes wrong fails its test with the error that ended it, never
+# hangs the suite, and leaves no transaction or connection behind.
 class CurrentReadsTest < ActiveSupport::TestCase
-  # Real connections must see each other's commits.
+  # Real connections must see each other's commits: transactional tests
+  # would pin one shared connection to every thread.
   self.use_transactional_tests = false
+
+  # How long any one step of a race may take before the test gives up on
+  # it: far longer than any real step, far shorter than a hung suite.
+  PATIENCE = 10 # seconds
 
   setup do
     skip "SQLite serializes writers: no transaction can read, wait, then write" if sqlite?
@@ -323,6 +334,63 @@ class CurrentReadsTest < ActiveSupport::TestCase
   end
 
   # ───────────────────────────────────────────────────────────────────────────
+  # Row locks serialize writers
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "concurrent debits on one wallet serialize through its row lock, each starting where the last one left it" do
+    # With overdrafts allowed nothing refuses a debit, so only the wallet
+    # lock keeps two of them from reading the same balance and writing the
+    # same snapshot: the snapshots must chain down from zero.
+    Wallets.configuration.allow_negative_balance = true
+    wallet = new_wallet
+
+    debits = all_at_once(Array.new(concurrency) { |i| i }) { Wallets::Wallet.find(wallet.id).debit(10, category: :purchase) }
+
+    assert debits.all?(Wallets::Transaction), "unexpected failures: #{debits.grep_v(Wallets::Transaction).map(&:inspect)}"
+    assert_equal Array.new(concurrency) { |i| [-10 * i, -10 * (i + 1)] }, debits.map { |debit| [debit.balance_before, debit.balance_after] }.sort.reverse
+    assert_equal(-10 * concurrency, wallet.reload.balance)
+    assert_equal(-10 * concurrency, wallet.read_attribute(:balance), "the cached balance matches the ledger")
+  end
+
+  test "concurrent overdraft transfers from one wallet serialize through the pair lock" do
+    # The same for transfers, which lock both wallets instead: only the lock
+    # keeps two of them from spending the same balance.
+    Wallets.configuration.allow_negative_balance = true
+    sender = new_wallet
+    recipients = Array.new(concurrency) { new_wallet }
+
+    transfers = all_at_once(recipients) do |recipient|
+      Wallets::Wallet.find(sender.id).transfer_to(Wallets::Wallet.find(recipient.id), 25, category: :peer_payment)
+    end
+
+    assert transfers.all?(Wallets::Transfer), "unexpected failures: #{transfers.grep_v(Wallets::Transfer).map(&:inspect)}"
+    outbound = transfers.map(&:outbound_transaction)
+    assert_equal Array.new(concurrency) { |i| [-25 * i, -25 * (i + 1)] }, outbound.map { |debit| [debit.balance_before, debit.balance_after] }.sort.reverse
+    assert_equal(-25 * concurrency, sender.reload.balance)
+    assert_equal(-25 * concurrency, sender.read_attribute(:balance), "the cached balance matches the ledger")
+    assert_equal [25] * concurrency, recipients.map(&:balance)
+  end
+
+  test "opposing transfers between two wallets serialize without deadlocking" do
+    # Each transfer locks the pair in id order, so A to B and B to A can
+    # never each hold one row while waiting for the other.
+    alice = new_wallet(initial_balance: 100)
+    bob = new_wallet(initial_balance: 100)
+
+    8.times do
+      transfers = all_at_once([[alice, bob], [bob, alice]]) do |from, to|
+        Wallets::Wallet.find(from.id).transfer_to(Wallets::Wallet.find(to.id), 10, category: :peer_payment)
+      end
+
+      assert transfers.all?(Wallets::Transfer), "unexpected failures: #{transfers.grep_v(Wallets::Transfer).map(&:inspect)}"
+    end
+
+    assert_equal [100, 100], [alice.reload.balance, bob.reload.balance]
+    assert_equal [100, 100], [alice.read_attribute(:balance), bob.read_attribute(:balance)], "the cached balances match the ledger"
+    assert_equal 16, Wallets::Transfer.where(from_wallet_id: [alice.id, bob.id]).count
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
   # Hold commands against concurrent writers
   # ───────────────────────────────────────────────────────────────────────────
 
@@ -545,6 +613,59 @@ class CurrentReadsTest < ActiveSupport::TestCase
     assert_equal 40, @wallet.reload.balance
   end
 
+  # ───────────────────────────────────────────────────────────────────────────
+  # The races themselves
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "a stale-read race fails at once with the error that ended it, wherever it strikes, and leaves nothing behind" do
+    # Neither side may strand the other: a worker that fails before its read
+    # must not leave the test waiting for it, and a test whose interleaved
+    # write fails must not leave the worker holding its transaction and its
+    # connection.
+    ran = []
+
+    error = assert_race_fails_cleanly(ActiveRecord::RecordNotFound, "before the worker's read") do
+      after_a_stale_read(-> { ran << :interleaved }, wallet: Wallets::Wallet.new) { ran << :block }
+    end
+    assert_match(/without an ID/, error.message)
+    assert_empty ran, "nothing runs once the read failed"
+
+    error = assert_race_fails_cleanly(RuntimeError, "in the interleaved write") do
+      after_a_stale_read(-> { raise "the interleaved write failed" }) { ran << :block }
+    end
+    assert_equal "the interleaved write failed", error.message
+    assert_empty ran, "the worker gave up instead of going on"
+
+    error = assert_race_fails_cleanly(RuntimeError, "in the worker's block") do
+      after_a_stale_read(-> {}) do |stale|
+        stale.debit(10, category: :purchase)
+        raise "the block failed"
+      end
+    end
+    assert_equal "the block failed", error.message
+    assert_empty @wallet.transactions.debits, "the worker's transaction was rolled back"
+  end
+
+  test "a wait that nothing answers gives up with what it waited for, instead of hanging the suite" do
+    error = assert_raises(Minitest::Assertion) { await(Queue.new, "an answer", patience: 0.01) }
+    assert_equal "Gave up after 0.01 s waiting for an answer", error.message
+
+    error = assert_raises(Minitest::Assertion) { await(Queue.new.tap(&:close), "an answer") }
+    assert_equal "Stopped waiting for an answer: the other side gave up", error.message
+  end
+
+  test "every racer holds a connection of its own before any of them starts" do
+    # The first racer to start finds every racer's connection checked out:
+    # none can finish, and give its connection back, before another has one.
+    pool = ActiveRecord::Base.connection_pool
+    checked_out = pool.stat[:busy]
+    seen_at_start = Queue.new
+
+    all_at_once(Array.new(concurrency) { |i| i }) { seen_at_start << pool.stat[:busy] }
+
+    assert_equal checked_out + concurrency, seen_at_start.pop
+  end
+
   private
 
   def drain(queue)
@@ -570,29 +691,41 @@ class CurrentReadsTest < ActiveSupport::TestCase
   # waits while `interleaved` commits on this test's connection. Records the
   # stale snapshots the worker remembers inside and after its transaction;
   # `then` runs on the worker's connection once its transaction has ended.
+  #
+  # An error on either side fails the test with that error, at once, and
+  # strands neither side: by the time this returns or raises, the worker has
+  # ended, its transaction is committed or rolled back, and its connection
+  # is back in the pool.
   def after_a_stale_read(interleaved, wallet: @wallet, joinable: true, then: nil)
     read_taken = Queue.new
     go_on = Queue.new
 
     worker = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
+      Thread.current.report_on_exception = false # the test raises what the worker ended with
+      ActiveRecord::Base.connection_pool.with_connection do |connection|
         result = Wallets::Wallet.transaction(joinable: joinable) do
           stale = Wallets::Wallet.find(wallet.id)
           stale.balance
-          read_taken << true
-          go_on.pop
+          read_taken << connection
+          await(go_on, "the interleaved write")
           yield(stale).tap { @remembered_inside = remembered_stale_snapshots }
         end
         @remembered_after = remembered_stale_snapshots
         binding.local_variable_get(:then)&.call
         result
       end
+    ensure
+      read_taken.close # wakes the test should the worker fail before its read
     end
 
-    read_taken.pop
+    worker_connection = await(read_taken, "the worker's first read", from: worker)
+    refute_same ActiveRecord::Base.connection, worker_connection, "the worker runs on a connection of its own"
     interleaved.call
     go_on << true
-    worker.value
+    finish(worker)
+  ensure
+    go_on.close # a worker still waiting gives up, and its transaction rolls back
+    settle(worker)
   end
 
   # The ledger reads that took row locks, leaving out the two locks every
@@ -610,21 +743,85 @@ class CurrentReadsTest < ActiveSupport::TestCase
     ActiveRecord::Base.connection_pool.size - 1
   end
 
-  # Releases one thread per item at the same moment; returns each block's
-  # result, or the error it raised.
+  # Runs the block once per item, each on a thread and a connection of its
+  # own, and starts them all at the same moment: every racer checks out its
+  # connection and reports ready before any is let go, so none can finish
+  # before another has even begun. Returns each block's result, or the
+  # error it raised.
   def all_at_once(items)
-    gate = Queue.new
-    threads = items.map do |item|
+    ready = Queue.new
+    start = Queue.new
+
+    racers = items.map do |item|
       Thread.new do
-        ActiveRecord::Base.connection_pool.with_connection do
-          gate.pop
-          yield item
-        rescue => error
-          error
+        Thread.current.report_on_exception = false # the test raises what a racer ended with
+        ActiveRecord::Base.connection_pool.with_connection do |connection|
+          ready << connection
+          await(start, "the start")
+          begin
+            yield item
+          rescue => error
+            error
+          end
         end
       end
     end
-    items.size.times { gate << true }
-    threads.map(&:value)
+
+    connections = Array.new(racers.size) { await(ready, "every racer's connection", from: racers) }
+    assert_equal connections.size, connections.uniq.size, "every racer runs on a connection of its own"
+    refute_includes connections, ActiveRecord::Base.connection, "and none on the test's"
+    racers.size.times { start << true }
+    racers.map { |racer| finish(racer) }
+  ensure
+    start.close # racers still waiting give up
+    settle(racers)
+  end
+
+  # The next value on `queue`, waited for no longer than `patience` seconds.
+  # When none comes, a thread `from` that ended with an error fails the test
+  # with that error: a sender that fails closes its queue on the way out.
+  def await(queue, what, from: [], patience: PATIENCE)
+    value = queue.pop(timeout: patience)
+    return value unless value.nil?
+
+    Array(from).each { |sender| sender.join(queue.closed? ? patience : 0) }
+    flunk(queue.closed? ? "Stopped waiting for #{what}: the other side gave up" : "Gave up after #{patience} s waiting for #{what}")
+  end
+
+  # What the thread returned, waited for no longer than PATIENCE. An error
+  # it ended with is raised here, as the test's own.
+  def finish(thread)
+    thread.join(PATIENCE) || flunk("Gave up after #{PATIENCE} s waiting for a racer to finish")
+    thread.value
+  end
+
+  # Ends every thread before the test does: each gets PATIENCE to end on its
+  # own, then is killed, which unwinds it all the same. Either way its
+  # transaction is rolled back unless it committed, and its connection goes
+  # back to the pool.
+  def settle(threads)
+    Array(threads).each do |thread|
+      thread.join(PATIENCE) || thread.kill.join(PATIENCE)
+    rescue Minitest::Assertion, StandardError
+      # Raised already by `finish`, or the test is failing for another reason.
+    end
+  end
+
+  # Runs the race in the block, which must raise `error_class`: at once,
+  # with no thread left running, no transaction open and no connection
+  # checked out.
+  def assert_race_fails_cleanly(error_class, where)
+    pool = ActiveRecord::Base.connection_pool
+    checked_out = pool.stat[:busy]
+    threads = Thread.list
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    error = assert_raises(error_class, "#{where}: its own error fails the test") { yield }
+
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, PATIENCE / 2.0, "#{where}: at once, never after a timeout"
+    assert_empty Thread.list - threads, "#{where}: no thread left running"
+    assert_equal checked_out, pool.stat[:busy], "#{where}: no connection left checked out"
+    assert pool.connections.none?(&:transaction_open?), "#{where}: no transaction left open"
+    error
   end
 end

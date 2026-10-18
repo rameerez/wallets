@@ -41,10 +41,16 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
     assert_match(/exist.*add_wallets_holds\.rb/, output)
 
     # Not even once the existing file no longer matches what the template
-    # renders today (a Rails upgrade changes the migration version).
-    File.write(first_migration, File.read(first_migration).sub(/Migration\[\d+\.\d+\]/, "Migration[7.2]"))
+    # renders today (a Rails upgrade changes the migration version, an app
+    # edits the file). A sentinel line changes it on every Rails version.
+    rendered = File.read(first_migration)
+    edited = rendered.sub(/^class /, "# Edited by the app after it was generated.\nclass ")
+    refute_equal rendered, edited, "the file must really differ from what the template renders"
+    File.write(first_migration, edited)
+
     run_generator
     assert_equal [first_migration], migration_files
+    assert_equal edited, File.read(first_migration), "and the edited file is left as it is"
   end
 
   test "the upgrade gives a 0.3 install exactly the schema a fresh 0.4 install has" do

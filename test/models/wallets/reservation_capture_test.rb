@@ -76,6 +76,10 @@ class Wallets::ReservationCaptureTest < ActiveSupport::TestCase
     assert_equal [44, 0, 44], balances(wallet)
   end
 
+  # Zero, negative, fractional, non-numeric, infinite, and more than the 30
+  # the reservations below set aside.
+  WRONG_CAPTURE_AMOUNTS = [0, -5, 1.5, "ten", Float::INFINITY, 31].freeze
+
   test "a capture amount above the reservation, or not a positive whole number, is refused before anything is written" do
     wallet = points_wallet(100)
     reservation = wallet.reserve(30, category: :booking)
@@ -85,13 +89,36 @@ class Wallets::ReservationCaptureTest < ActiveSupport::TestCase
     end
     assert_equal "Cannot capture 31: reservation #{reservation.id} sets aside 30", error.message
 
-    [0, -5, 1.5, "ten", Float::INFINITY].each do |amount|
+    WRONG_CAPTURE_AMOUNTS.each do |amount|
       assert_nothing_written(wallet) do
         assert_raises(ArgumentError, "amount #{amount.inspect} must be refused") { reservation.capture!(amount, category: :booking_charge) }
       end
     end
     assert reservation.reload.active?
     assert_equal [70, 30, 100], balances(wallet)
+  end
+
+  test "retrying a finished capture raises InvalidHold whatever amount it repeats" do
+    # The state is checked before the amount, so a retry handler that
+    # rescues InvalidHold sees every retry of a finished capture, never an
+    # ArgumentError about an amount that no longer matters.
+    freeze_time
+    wallet = points_wallet(100)
+    captured = wallet.reserve(30, category: :booking)
+    captured.capture!(category: :booking_charge)
+    released = wallet.reserve(30, category: :booking)
+    released.release!(reason: "cancelled")
+    lapsed = wallet.reserve(30, category: :booking, until: 1.hour.from_now)
+    travel 1.hour
+
+    {captured: [captured, /was already captured/], released: [released, /was released/], lapsed: [lapsed, /lapsed at/]}.each do |state, (reservation, message)|
+      WRONG_CAPTURE_AMOUNTS.each do |amount|
+        error = assert_nothing_written(wallet) do
+          assert_raises(Wallets::InvalidHold, "a #{state} reservation with #{amount.inspect}") { reservation.capture!(amount, category: :booking_charge) }
+        end
+        assert_match message, error.message
+      end
+    end
   end
 
   test "a capture needs a category, and an unknown one leaves the reservation untouched" do
