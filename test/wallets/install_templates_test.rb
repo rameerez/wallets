@@ -24,9 +24,7 @@ class Wallets::InstallTemplatesTest < ActiveSupport::TestCase
       holds_table = template[/create_table holds_table.*?\n    end\n/m]
 
       assert holds_table, "#{File.basename(path)} must create the holds table"
-      assert_includes template, 'def holds_table
-    "#{table_prefix}holds"
-  end'
+      assert_includes template, "def holds_table\n    \"\#{table_prefix}holds\"\n  end"
       assert_includes holds_table, "t.references :wallet, null: false"
       assert_includes holds_table, "foreign_key: { to_table: wallets_table }"
       assert_equal 2, holds_table.scan("foreign_key: { to_table: transactions_table }").size
