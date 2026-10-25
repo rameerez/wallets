@@ -1,3 +1,13 @@
+## [0.5.0] - 2026-10-25
+
+### Added
+
+- **Idempotency keys.** `credit`, `debit`, `transfer_to`, `hold`, `reserve` and `Hold#capture!` take `idempotency_key:`. The first call stores the key on the row it writes (the transaction, the transfer's outbound leg, the hold, or the capture's debit). A retry with the same key returns that row and posts nothing: no second posting, no callbacks, and no `InvalidHold` for a reservation the first call already captured. The same key for a different amount, category or target raises the new `Wallets::IdempotencyConflict` and writes nothing. Keys are unique per wallet among its transactions and among its holds, so a reservation and its capture can share one. The lookup runs under the wallet lock (a current read when a MySQL snapshot is stale), so concurrent duplicates post once, and a unique index on `(wallet_id, idempotency_key)` backs it up. `release!` needs no key: it was already idempotent. Asked for by ReplyBrain, whose at-least-once jobs reserve an estimate and capture the actual cost.
+
+### Upgrading
+
+- Run `rails generate wallets:upgrade` and `rails db:migrate`. The generator now writes `add_wallets_idempotency_keys`, which adds a nullable `idempotency_key` string and a unique `(wallet_id, idempotency_key)` index to the transactions and holds tables; it is a no-op where they exist, and fresh installs get them from `wallets:install`. Until it has run, a command given a key raises `Wallets::Error`; commands without a key work exactly as before. Embedded ledgers opt in by adding the same column and index to their own tables.
+
 ## [0.4.3] - 2026-10-19
 
 ### Fixed

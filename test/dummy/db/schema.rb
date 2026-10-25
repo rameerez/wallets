@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[7.2].define(version: 2026_10_17_120000) do
+ActiveRecord::Schema[7.2].define(version: 2026_10_25_120000) do
   create_table "users", force: :cascade do |t|
     t.string "email"
     t.string "name"
@@ -43,9 +43,11 @@ ActiveRecord::Schema[7.2].define(version: 2026_10_17_120000) do
     t.json "release_metadata", default: {}, null: false
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+    t.string "idempotency_key"
     t.index ["capture_transaction_id"], name: "index_wallets_holds_on_capture_tx", unique: true
     t.index ["releases_at"], name: "index_wallets_holds_on_releases_at"
     t.index ["transaction_id", "released_at"], name: "index_wallets_holds_on_tx_and_released_at"
+    t.index ["wallet_id", "idempotency_key"], name: "index_wallets_holds_on_wallet_and_idempotency_key", unique: true
     t.index ["wallet_id", "released_at"], name: "index_wallets_holds_on_wallet_and_released_at"
     t.check_constraint "amount IS NULL OR amount > 0", name: "check_wallets_holds_amount_positive"
     t.check_constraint "capture_transaction_id IS NULL OR (transaction_id IS NULL AND amount IS NOT NULL AND released_at IS NOT NULL)", name: "check_wallets_holds_capture_ends_reservation"
@@ -61,11 +63,13 @@ ActiveRecord::Schema[7.2].define(version: 2026_10_17_120000) do
     t.json "metadata", default: {}, null: false
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+    t.string "idempotency_key"
     t.index ["category"], name: "index_wallets_transactions_on_category"
     t.index ["expires_at", "id"], name: "index_wallets_transactions_on_expires_at_and_id"
     t.index ["expires_at"], name: "index_wallets_transactions_on_expires_at"
     t.index ["transfer_id"], name: "index_wallets_transactions_on_transfer_id"
     t.index ["wallet_id", "amount"], name: "index_wallets_transactions_on_wallet_id_and_amount"
+    t.index ["wallet_id", "idempotency_key"], name: "index_wallets_transactions_on_wallet_and_idempotency_key", unique: true
     t.index ["wallet_id"], name: "index_wallets_transactions_on_wallet_id"
     t.check_constraint "amount <> 0", name: "check_wallets_transactions_amount_nonzero"
   end

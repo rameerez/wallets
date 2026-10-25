@@ -37,6 +37,8 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
       t.datetime :expires_at
       t.references :transfer, type: foreign_key_type, foreign_key: { to_table: transfers_table }
       t.send(json_column_type, :metadata, null: false, default: json_column_default)
+      # The key a retried command is recognised by, unique per wallet.
+      t.string :idempotency_key
 
       t.timestamps
     end
@@ -82,6 +84,8 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
       t.string :release_reason
       t.send(json_column_type, :metadata, null: false, default: json_column_default)
       t.send(json_column_type, :release_metadata, null: false, default: json_column_default)
+      # The key a retried hold or reservation is recognised by, unique per wallet.
+      t.string :idempotency_key
 
       t.timestamps
 
@@ -92,6 +96,7 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
       t.index [:wallet_id, :released_at], name: index_name("holds_on_wallet_and_released_at")
       t.index [:transaction_id, :released_at], name: index_name("holds_on_tx_and_released_at")
       t.index :releases_at, name: index_name("holds_on_releases_at")
+      t.index [:wallet_id, :idempotency_key], unique: true, name: index_name("holds_on_wallet_and_idempotency_key")
 
       t.check_constraint "amount IS NULL OR amount > 0", name: constraint_name("holds_amount_positive")
       # A credit hold holds the credit's whole remaining value, never an amount.
@@ -118,6 +123,7 @@ class CreateWalletsTables < ActiveRecord::Migration<%= migration_version %>
     add_index transactions_table, :category
     add_index transactions_table, :expires_at
     add_index transactions_table, [:wallet_id, :amount], name: index_name("transactions_on_wallet_id_and_amount")
+    add_index transactions_table, [:wallet_id, :idempotency_key], unique: true, name: index_name("transactions_on_wallet_and_idempotency_key")
     add_index transactions_table, [:expires_at, :id], name: index_name("transactions_on_expires_at_and_id")
     add_index allocations_table, [:transaction_id, :source_transaction_id], name: index_name("allocations_on_tx_and_source_tx")
     add_index transfers_table, [:from_wallet_id, :to_wallet_id, :asset_code], name: index_name("transfers_on_wallets_and_asset")

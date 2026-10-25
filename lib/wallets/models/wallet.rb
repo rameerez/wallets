@@ -37,6 +37,7 @@ module Wallets
     CORE_TRANSACTION_ATTRIBUTE_NAMES = %i[
       id wallet wallet_id amount category expires_at metadata transfer
       transfer_id balance_before balance_after created_at updated_at
+      idempotency_key
     ].freeze
 
     # Plain SELECTs on these adapters may answer from a stale snapshot inside
@@ -381,29 +382,42 @@ module Wallets
     #   wallet.credit(751, category: :reward, hold: :pending_validation)
     #   wallet.credit(751, category: :reward, hold: {category: :pending_validation, until: 3.months.from_now, metadata: {ride_id: 7}})
     #   wallet.credit(500, category: :reward, available_at: 14.days.from_now) # held as :pending until then
-    def credit(amount, metadata: {}, category: :credit, expires_at: nil, transfer: nil, hold: nil, available_at: nil, **extra_transaction_attributes)
+    #
+    # Every command that posts takes an `idempotency_key:`. The first call
+    # with a key posts and stores the key on the row it writes; a retry with
+    # the same key returns that row and posts nothing, so a job that runs
+    # twice charges once. The same key for a different command raises
+    # Wallets::IdempotencyConflict.
+    #
+    #   wallet.credit(500, category: :top_up, idempotency_key: "stripe:#{invoice.id}")
+    def credit(amount, metadata: {}, category: :credit, expires_at: nil, transfer: nil, hold: nil, available_at: nil, idempotency_key: nil, **extra_transaction_attributes)
       metadata = normalize_metadata(metadata)
       extra_transaction_attributes = validate_additional_transaction_attributes!(extra_transaction_attributes)
       arrival_hold = arrival_hold_attributes(hold, available_at)
+      idempotency_key = normalize_idempotency_key!(idempotency_key, transaction_class)
 
       # A savepoint even inside a caller's transaction, like every command: a
       # credit that cannot get its hold must not survive as a spendable credit
       # because the caller rescued the error and committed.
       with_lock(requires_new: true) do
         mutating_at(Time.current) do
-          # Value that becomes available at an instant already reached is
-          # simply available: there is nothing left to hold.
-          arrival_hold = nil if available_at && arrival_hold[:releases_at] <= evaluation_time
+          same_credit = ->(earlier) { earlier.amount == normalize_positive_amount!(amount) && earlier.category == category.to_s && earlier.transfer_id == transfer&.id }
 
-          apply_credit(
-            amount,
-            metadata: metadata,
-            category: category,
-            expires_at: expires_at,
-            transfer: transfer,
-            extra_attributes: extra_transaction_attributes,
-            hold: arrival_hold
-          )
+          once_per_key(idempotency_key, transaction_class, same: same_credit) do
+            # Value that becomes available at an instant already reached is
+            # simply available: there is nothing left to hold.
+            arrival_hold = nil if available_at && arrival_hold[:releases_at] <= evaluation_time
+
+            apply_credit(
+              amount,
+              metadata: metadata,
+              category: category,
+              expires_at: expires_at,
+              transfer: transfer,
+              extra_attributes: extra_transaction_attributes.merge(keyed(idempotency_key)),
+              hold: arrival_hold
+            )
+          end
         end
       end
     end
@@ -426,20 +440,27 @@ module Wallets
     # with overdrafts off, what it takes from unheld credits must fit in the
     # available balance, so naming an unheld credit cannot spend value that a
     # reservation set aside, nor deepen a deficit.
-    def debit(amount, metadata: {}, category: :debit, transfer: nil, from: ELIGIBLE_CREDITS, **extra_transaction_attributes)
+    def debit(amount, metadata: {}, category: :debit, transfer: nil, from: ELIGIBLE_CREDITS, idempotency_key: nil, **extra_transaction_attributes)
       metadata = normalize_metadata(metadata)
       extra_transaction_attributes = validate_additional_transaction_attributes!(extra_transaction_attributes)
       sources = named_credits(from)
+      idempotency_key = normalize_idempotency_key!(idempotency_key, transaction_class)
 
       with_lock(requires_new: true) do
-        apply_debit(
-          amount,
-          metadata: metadata,
-          category: category,
-          transfer: transfer,
-          extra_attributes: extra_transaction_attributes,
-          from: sources
-        )
+        mutating_at(Time.current) do
+          same_debit = ->(earlier) { earlier.amount == -normalize_positive_amount!(amount) && earlier.category == category.to_s && earlier.transfer_id == transfer&.id && !capture?(earlier) }
+
+          once_per_key(idempotency_key, transaction_class, same: same_debit) do
+            apply_debit(
+              amount,
+              metadata: metadata,
+              category: category,
+              transfer: transfer,
+              extra_attributes: extra_transaction_attributes.merge(keyed(idempotency_key)),
+              from: sources
+            )
+          end
+        end
       end
     end
 
@@ -458,7 +479,7 @@ module Wallets
     #
     # Only leaving the credit out holds the whole wallet: an explicit nil
     # (a credit that was looked up and not found) is refused.
-    def hold(credit = WHOLE_WALLET, category:, until: nil, metadata: {})
+    def hold(credit = WHOLE_WALLET, category:, until: nil, metadata: {}, idempotency_key: nil)
       ensure_holds_enabled!
       raise ArgumentError, "Pass no credit to hold the whole wallet; nil is not a credit" if credit.nil?
 
@@ -467,15 +488,20 @@ module Wallets
       # `until` is a Ruby keyword: the argument reads as plain English at the
       # call site, and the binding is the only way to reach it in here.
       releases_at = normalize_deadline(binding.local_variable_get(:until))
+      idempotency_key = normalize_idempotency_key!(idempotency_key, hold_class)
 
       with_lock(requires_new: true) do
         mutating_at(Time.current) do
-          # The target first: a wrong argument is a wrong argument, whatever
-          # the deadline says.
-          ensure_holdable!(credit) unless credit.nil?
-          ensure_deadline_ahead!(releases_at)
+          same_hold = ->(earlier) { earlier.coverage? && earlier.transaction_id == credit&.id && earlier.category == category.to_s.strip }
 
-          place_hold!(credit: credit, category: category, releases_at: releases_at, metadata: metadata)
+          once_per_key(idempotency_key, hold_class, same: same_hold) do
+            # The target first: a wrong argument is a wrong argument, whatever
+            # the deadline says.
+            ensure_holdable!(credit) unless credit.nil?
+            ensure_deadline_ahead!(releases_at)
+
+            place_hold!(credit: credit, category: category, releases_at: releases_at, metadata: metadata, **keyed(idempotency_key))
+          end
         end
       end
     end
@@ -485,22 +511,33 @@ module Wallets
     # must fit in `balance` unless `allow_negative_balance` is on.
     #
     #   wallet.reserve(3_000, category: :booking, until: 7.days.from_now, metadata: {booking_id: 9})
-    def reserve(amount, category:, until: nil, metadata: {})
+    #
+    # A reservation made from a job that may run twice takes a key, and so
+    # does its capture (see `credit`):
+    #
+    #   reservation = wallet.reserve(estimate, category: :run, idempotency_key: "run:#{run.id}")
+    #   reservation.capture!(actual, category: :run, idempotency_key: "run:#{run.id}")
+    def reserve(amount, category:, until: nil, metadata: {}, idempotency_key: nil)
       ensure_holds_enabled!
       amount = normalize_positive_amount!(amount)
       metadata = normalize_metadata(metadata)
       releases_at = normalize_deadline(binding.local_variable_get(:until))
+      idempotency_key = normalize_idempotency_key!(idempotency_key, hold_class)
 
       with_lock(requires_new: true) do
         mutating_at(Time.current) do
-          ensure_deadline_ahead!(releases_at)
-          available = balance
+          same_reservation = ->(earlier) { earlier.amount == amount && earlier.category == category.to_s.strip }
 
-          if amount > available && !allow_negative_balance?
-            reject_insufficient_balance!(amount, available, metadata)
+          once_per_key(idempotency_key, hold_class, same: same_reservation) do
+            ensure_deadline_ahead!(releases_at)
+            available = balance
+
+            if amount > available && !allow_negative_balance?
+              reject_insufficient_balance!(amount, available, metadata)
+            end
+
+            place_hold!(amount: amount, category: category, releases_at: releases_at, metadata: metadata, previous_balance: available, **keyed(idempotency_key))
           end
-
-          place_hold!(amount: amount, category: category, releases_at: releases_at, metadata: metadata, previous_balance: available)
         end
       end
     end
@@ -514,7 +551,11 @@ module Wallets
     # held value included, and the inbound legs are credited as usual.
     #
     #   wallet.transfer_to(platform.wallet, 751, category: :reversal, from: credit)
-    def transfer_to(other_wallet, amount, category: :transfer, metadata: {}, expiration_policy: nil, expires_at: nil, from: ELIGIBLE_CREDITS)
+    #
+    # With `idempotency_key:` a retried transfer returns the Transfer it made
+    # the first time (see `credit`). The key is the sender's: it is stored
+    # on the outbound leg.
+    def transfer_to(other_wallet, amount, category: :transfer, metadata: {}, expiration_policy: nil, expires_at: nil, from: ELIGIBLE_CREDITS, idempotency_key: nil)
       raise InvalidTransfer, "Target wallet is required" if other_wallet.nil?
       raise InvalidTransfer, "Source wallet must be persisted" unless persisted?
       raise InvalidTransfer, "Target wallet must be persisted" unless other_wallet.persisted?
@@ -528,6 +569,7 @@ module Wallets
       metadata = normalize_metadata(metadata)
       resolved_policy, inbound_expires_at = resolve_transfer_expiration!(expiration_policy, expires_at)
       sources = named_credits(from)
+      idempotency_key = normalize_idempotency_key!(idempotency_key, transaction_class)
 
       # A savepoint even inside a caller's transaction, like every command: a
       # transfer whose inbound leg fails must take its outbound debit and its
@@ -538,6 +580,14 @@ module Wallets
 
         # The recipient pins the same instant in its own `apply_credit`.
         mutating_at(now) do
+          same_transfer = ->(earlier) {
+            sent = earlier.transfer
+            earlier.category == "transfer_out" && sent.present? &&
+              sent.to_wallet_id == other_wallet.id && sent.amount == amount && sent.category == category.to_s
+          }
+          earlier = earlier_command(idempotency_key, transaction_class, same: same_transfer)
+          next earlier.transfer if earlier
+
           previous_balance = balance
 
           # Insufficient-balance gate.
@@ -620,6 +670,7 @@ module Wallets
 
           _outbound_transaction, allocations = apply_debit_with_allocations(
             amount,
+            extra_attributes: keyed(idempotency_key),
             category: :transfer_out,
             metadata: shared_metadata.merge(
               "counterparty_wallet_id" => other_wallet.id,
@@ -1270,14 +1321,27 @@ module Wallets
     # the callbacks report are the ones before and after the whole step,
     # never the instant in between where the reservation is gone and the
     # debit not yet posted: capturing a fully reserved wallet reads 0 -> 0.
-    def capture_reservation!(reservation, amount, category:, metadata:)
+    #
+    # A capture with a key looks for it before anything else, so that the
+    # retry of a capture that went through returns its debit rather than
+    # raising Wallets::InvalidHold for the reservation it already ended.
+    def capture_reservation!(reservation, amount, category:, metadata:, idempotency_key: nil)
       metadata = normalize_metadata(metadata)
+      idempotency_key = normalize_idempotency_key!(idempotency_key, transaction_class)
 
       ending_hold(reservation) do
         mutating_at(Time.current) do
           # A locking read: the reservation as it is now, whatever an earlier
           # read in this transaction saw.
           reservation.lock!
+
+          same_capture = ->(earlier) {
+            earlier.id == reservation.capture_transaction_id && earlier.category == category.to_s &&
+              (amount.nil? || earlier.amount == -normalize_positive_amount!(amount))
+          }
+          earlier = earlier_command(idempotency_key, transaction_class, same: same_capture)
+          next earlier if earlier
+
           ensure_capturable!(reservation)
           amount = capture_amount(reservation, amount)
 
@@ -1293,7 +1357,7 @@ module Wallets
           # With overdrafts on, a capture beyond the eligible credits leaves
           # exactly the rest unbacked; one within them leaves no debt at all,
           # however underfunded the other reservations end up.
-          debit, _allocations = post_debit!(amount, metadata: metadata, category: category, transfer: nil, allow_unbacked: allow_negative_balance?)
+          debit, _allocations = post_debit!(amount, metadata: metadata, category: category, transfer: nil, extra_attributes: keyed(idempotency_key), allow_unbacked: allow_negative_balance?)
           reservation.update!(released_at: evaluation_time, release_reason: "captured", capture_transaction: debit)
           new_balance = refresh_cached_balance!
 
@@ -1337,6 +1401,69 @@ module Wallets
       unless reservation.active?(at: evaluation_time)
         raise InvalidHold, "Reservation #{reservation.id} lapsed at #{reservation.releases_at.iso8601} and can no longer be captured"
       end
+    end
+
+    # =========================================
+    # Idempotency Keys
+    # =========================================
+
+    # The key a command was given, ready to look up and store: nil for none,
+    # a non-blank string otherwise. A ledger whose table has no
+    # `idempotency_key` column (an embedder's, or an install that has not
+    # run `rails g wallets:upgrade`) refuses a key rather than ignore it: a
+    # key that is silently dropped would let a retry post twice.
+    def normalize_idempotency_key!(key, model)
+      return if key.nil?
+
+      key = key.to_s
+      raise ArgumentError, "idempotency_key can't be blank" if key.strip.empty?
+      unless model.column_names.include?("idempotency_key")
+        raise Error, "#{model.table_name} has no idempotency_key column: run `rails g wallets:upgrade` and migrate to use idempotency keys"
+      end
+
+      key
+    end
+
+    # The attributes that store a key on the row a command writes.
+    def keyed(idempotency_key)
+      idempotency_key.nil? ? {} : {idempotency_key: idempotency_key}
+    end
+
+    # Runs a command once per key: the row an earlier call with this key
+    # posted, or whatever the block posts now.
+    def once_per_key(idempotency_key, model, same:)
+      earlier_command(idempotency_key, model, same: same) || yield
+    end
+
+    # The row this wallet already posted under `idempotency_key`, if any.
+    # Read under the wallet lock at the command's instant, as a current read
+    # when the snapshot is stale (see `stale_snapshot?`): every command on
+    # this wallet queues on that lock, so a duplicate running at the same
+    # time waits for the first to commit and then finds its row. The unique
+    # index on (wallet_id, idempotency_key) is the backstop.
+    #
+    # `same` tells a retry from a different command that reuses the key: the
+    # amount, the category and what the command acts on must match. Metadata,
+    # deadlines and expirations are the first call's, so a retry that
+    # recomputes `7.days.from_now` is still a retry.
+    def earlier_command(idempotency_key, model, same:)
+      return if idempotency_key.nil?
+
+      earlier = current_read(model.where(wallet_id: id, idempotency_key: idempotency_key), current_reads?).take
+      return if earlier.nil?
+
+      unless same.call(earlier)
+        raise IdempotencyConflict, "Idempotency key #{idempotency_key.inspect} was already used on wallet #{id} " \
+          "for a different command (#{model.model_name.human.downcase} #{earlier.id})"
+      end
+
+      earlier
+    end
+
+    # Whether a debit is a reservation's capture: a plain debit's key must
+    # not replay a capture, nor the other way round.
+    def capture?(debit)
+      holds_enabled? && hold_class.where(capture_transaction_id: debit.id).exists?
     end
 
     # A credit can be held when it is a saved credit of this very wallet and

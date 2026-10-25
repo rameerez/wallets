@@ -656,6 +656,64 @@ class CurrentReadsTest < ActiveSupport::TestCase
   end
 
   # ───────────────────────────────────────────────────────────────────────────
+  # Idempotency keys: duplicates queue on the wallet lock and post once
+  # ───────────────────────────────────────────────────────────────────────────
+
+  test "concurrent duplicates of one keyed credit post once and all return it" do
+    credited = Queue.new
+    Wallets.configuration.on_balance_credited { |context| credited << context.transaction.id }
+
+    outcomes = all_at_once(Array.new(concurrency) { |i| i }) do
+      Wallets::Wallet.find(@wallet.id).credit(25, category: :top_up, idempotency_key: "invoice:1")
+    end
+
+    assert outcomes.all?(Wallets::Transaction), "unexpected outcomes: #{outcomes.map(&:inspect)}"
+    assert_equal 1, outcomes.map(&:id).uniq.size, "every duplicate returns the one credit"
+    assert_equal [outcomes.first.id], drain(credited), "and it is reported once"
+    assert_equal 125, @wallet.reload.balance
+  end
+
+  test "concurrent duplicates of one keyed reservation and its keyed capture each post once" do
+    reservations = all_at_once(Array.new(concurrency) { |i| i }) do
+      Wallets::Wallet.find(@wallet.id).reserve(60, category: :booking, idempotency_key: "run:1")
+    end
+    assert reservations.all?(Wallets::Hold), "unexpected outcomes: #{reservations.map(&:inspect)}"
+    assert_equal 1, reservations.map(&:id).uniq.size
+    assert_equal 1, @wallet.holds.count
+
+    captures = all_at_once(Array.new(concurrency) { |i| i }) do
+      Wallets::Hold.find(reservations.first.id).capture!(50, category: :purchase, idempotency_key: "run:1")
+    end
+
+    assert captures.all?(Wallets::Transaction), "a keyed retry is answered, never refused: #{captures.map(&:inspect)}"
+    assert_equal 1, captures.map(&:id).uniq.size
+    assert_equal [captures.first.id], @wallet.transactions.debits.pluck(:id)
+    assert_equal 50, @wallet.reload.balance
+  end
+
+  test "concurrent duplicates of one keyed transfer move the value once" do
+    recipient = new_wallet
+
+    outcomes = all_at_once(Array.new(concurrency) { |i| i }) do
+      Wallets::Wallet.find(@wallet.id).transfer_to(Wallets::Wallet.find(recipient.id), 40, idempotency_key: "payment:1")
+    end
+
+    assert outcomes.all?(Wallets::Transfer), "unexpected outcomes: #{outcomes.map(&:inspect)}"
+    assert_equal 1, outcomes.map(&:id).uniq.size
+    assert_equal [60, 40], [@wallet.reload.balance, recipient.reload.balance]
+  end
+
+  test "a keyed debit after a stale read finds the debit another connection committed with its key" do
+    first = Queue.new
+    retry_ = after_a_stale_read(-> { first << Wallets::Wallet.find(@wallet.id).debit(30, category: :purchase, idempotency_key: "order:1") }) do |wallet|
+      wallet.debit(30, category: :purchase, idempotency_key: "order:1")
+    end
+
+    assert_equal first.pop.id, retry_.id
+    assert_equal 70, @wallet.reload.balance
+  end
+
+  # ───────────────────────────────────────────────────────────────────────────
   # The races themselves
   # ───────────────────────────────────────────────────────────────────────────
 

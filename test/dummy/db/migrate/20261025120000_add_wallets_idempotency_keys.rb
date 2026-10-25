@@ -1,0 +1,47 @@
+# frozen_string_literal: true
+
+# Adds idempotency keys (wallets 0.5) to an existing installation: a key on
+# transactions and on holds, unique per wallet, so a retried command returns
+# what it posted the first time instead of posting again.
+class AddWalletsIdempotencyKeys < ActiveRecord::Migration[7.2]
+  def up
+    [transactions_table, holds_table].each do |table|
+      next unless table_exists?(table)
+
+      add_column table, :idempotency_key, :string unless column_exists?(table, :idempotency_key)
+      unless index_exists?(table, [:wallet_id, :idempotency_key], unique: true)
+        add_index table, [:wallet_id, :idempotency_key], unique: true, name: index_name(table)
+      end
+    end
+  end
+
+  # The keys only recognise retries: dropping them loses no value, only the
+  # ability to tell a retry from a new command.
+  def down
+    [transactions_table, holds_table].each do |table|
+      next unless table_exists?(table) && column_exists?(table, :idempotency_key)
+
+      remove_index table, name: index_name(table) if index_name_exists?(table, index_name(table))
+      remove_column table, :idempotency_key
+    end
+  end
+
+  private
+
+  def table_prefix
+    Wallets.configuration.table_prefix
+  end
+
+  def transactions_table
+    "#{table_prefix}transactions"
+  end
+
+  def holds_table
+    "#{table_prefix}holds"
+  end
+
+  # The names the install template gives the same indexes.
+  def index_name(table)
+    "index_#{table}_on_wallet_and_idempotency_key"
+  end
+end
