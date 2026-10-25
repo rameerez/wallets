@@ -62,16 +62,20 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
       # A fresh 0.4 install, minus its holds table and its wallets' ledger
       # revision, is a 0.3 install: 0.4 changes nothing else.
       migrate(install_migration, :up)
-      fresh_install = [table_shape("upgcheck_holds"), ledger_revision_shape("upgcheck_")]
-      refute_nil fresh_install.last, "a fresh 0.4 install has the ledger revision"
+      fresh_install = upgraded_shapes("upgcheck_")
+      refute_nil fresh_install[1], "a fresh install has the ledger revision"
       connection.drop_table("upgcheck_holds")
       connection.remove_column("upgcheck_wallets", :ledger_revision)
+      connection.remove_index("upgcheck_transactions", name: "index_upgcheck_transactions_on_wallet_and_idempotency_key")
+      connection.remove_column("upgcheck_transactions", :idempotency_key)
 
       migrate(upgrade_migration, :up)
+      migrate(idempotency_keys_migration, :up)
 
-      assert_equal fresh_install, [table_shape("upgcheck_holds"), ledger_revision_shape("upgcheck_")]
+      assert_equal fresh_install, upgraded_shapes("upgcheck_")
       assert_holds_table_enforces_its_keys("upgcheck_")
 
+      migrate(idempotency_keys_migration, :down)
       migrate(upgrade_migration, :down)
 
       refute connection.data_source_exists?("upgcheck_holds")
@@ -91,6 +95,42 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
     assert_empty migration_files
     assert_match(/skip.*wallets_holds already exists/, output)
     assert_match(/nothing to migrate/, output)
+  end
+
+  test "a 0.4 install gets only the idempotency keys migration, which adds and removes the keys cleanly" do
+    Wallets.configuration.table_prefix = "upg04_"
+    tables = %w[upg04_wallets upg04_transfers upg04_transactions upg04_allocations upg04_holds]
+
+    with_tables_cleaned_up(tables) do
+      migrate(install_migration, :up)
+      fresh_install = upgraded_shapes("upg04_")
+      %w[transactions holds].each do |suffix|
+        connection.remove_index("upg04_#{suffix}", name: "index_upg04_#{suffix}_on_wallet_and_idempotency_key")
+        connection.remove_column("upg04_#{suffix}", :idempotency_key)
+      end
+
+      output = run_generator
+
+      assert_empty migration_files, "the holds are already there"
+      assert_match(/skip.*upg04_holds already exists/, output)
+      assert_match(/create.*add_wallets_idempotency_keys\.rb/, output)
+
+      migrate(idempotency_keys_migration, :up)
+      assert_equal fresh_install, upgraded_shapes("upg04_")
+      migrate(idempotency_keys_migration, :up)
+      assert_equal fresh_install, upgraded_shapes("upg04_"), "running it twice changes nothing"
+
+      migrate(idempotency_keys_migration, :down)
+      %w[transactions holds].each do |suffix|
+        refute connection.column_exists?("upg04_#{suffix}", :idempotency_key), "upg04_#{suffix} is back to its 0.4 shape"
+      end
+
+      migrate(idempotency_keys_migration, :up)
+      prepare_destination
+      output = run_generator
+      assert_match(/skip.*upg04_transactions already has idempotency keys/, output)
+      assert_match(/nothing to migrate/, output)
+    end
   end
 
   test "the generator still writes the migration when the wallets lack their ledger revision" do
@@ -189,7 +229,7 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
 
     with_tables_cleaned_up(tables) do
       migrate(install_migration, :up)
-      fresh_install = [table_shape("upg02_holds"), ledger_revision_shape("upg02_")]
+      fresh_install = upgraded_shapes("upg02_")
       migrate(install_migration, :down)
 
       migrate(install_migration(file_fixture("create_wallets_tables_0_2.rb.erb")), :up)
@@ -198,8 +238,9 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
       assert_nil ledger_revision_shape("upg02_")
 
       migrate(upgrade_migration, :up)
+      migrate(idempotency_keys_migration, :up)
 
-      assert_equal fresh_install, [table_shape("upg02_holds"), ledger_revision_shape("upg02_")]
+      assert_equal fresh_install, upgraded_shapes("upg02_")
       assert_holds_table_enforces_its_keys("upg02_")
     end
   end
@@ -322,6 +363,24 @@ class Wallets::UpgradeGeneratorTest < Rails::Generators::TestCase
   end
 
   # Loaded under a sandbox module so the tests never touch a global constant.
+  def idempotency_keys_migration
+    sandbox = Module.new
+    load Dir.glob(File.join(destination_root, "db/migrate/*_add_wallets_idempotency_keys.rb")).sole, sandbox
+    sandbox.const_get(:AddWalletsIdempotencyKeys).new
+  end
+
+  # What the upgrades change: the holds table, the wallets' ledger revision,
+  # and the transactions' idempotency key with its unique index.
+  def upgraded_shapes(prefix)
+    transactions = table_shape("#{prefix}transactions")
+    [
+      table_shape("#{prefix}holds"),
+      ledger_revision_shape(prefix),
+      transactions[:columns].select { |column| column.first == "idempotency_key" },
+      transactions[:indexes].select { |index| index.first.end_with?("idempotency_key") }
+    ]
+  end
+
   def upgrade_migration
     sandbox = Module.new
     load migration_files.sole, sandbox

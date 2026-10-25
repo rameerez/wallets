@@ -162,12 +162,16 @@ module Wallets
     # funded at the moment it happens: value a hold covers is not spent, and
     # unless overdrafts are on a capture the wallet cannot fund raises
     # Wallets::InsufficientBalance and leaves the reservation as it was.
-    def capture!(amount = nil, category:, metadata: {})
+    #
+    # With `idempotency_key:` a retried capture returns the debit it posted
+    # the first time instead of raising, so an at-least-once job can simply
+    # run again (see `Wallets::WalletBase#credit`).
+    def capture!(amount = nil, category:, metadata: {}, idempotency_key: nil)
       raise InvalidHold, "Only a saved reservation can be captured" unless persisted?
 
       # The wallet runs the capture: it takes its own lock before reading
       # this reservation, the same order as every other command.
-      wallet.send(:capture_reservation!, self, amount, category: category, metadata: metadata)
+      wallet.send(:capture_reservation!, self, amount, category: category, metadata: metadata, idempotency_key: idempotency_key)
     end
 
     private

@@ -71,10 +71,15 @@ class Wallets::InstallGeneratorTest < Rails::Generators::TestCase
             index_gencheck_holds_on_capture_tx
             index_gencheck_holds_on_releases_at
             index_gencheck_holds_on_tx_and_released_at
+            index_gencheck_holds_on_wallet_and_idempotency_key
             index_gencheck_holds_on_wallet_and_released_at
           ],
           connection.indexes("gencheck_holds").map(&:name).sort
         )
+        %w[gencheck_transactions gencheck_holds].each do |table|
+          key = connection.indexes(table).find { |index| index.columns == %w[wallet_id idempotency_key] }
+          assert key&.unique, "#{table} keeps one idempotency key per wallet"
+        end
 
         migration.migrate(:down)
         tables.each { |table| refute connection.data_source_exists?(table), "expected #{table} to be dropped" }

@@ -68,6 +68,25 @@ class Wallets::InstallTemplatesTest < ActiveSupport::TestCase
     assert_equal rendered, File.read(dummy_migration)
   end
 
+  test "the dummy app's idempotency keys migration is the upgrade template, rendered" do
+    rendered = ERB.new(File.read(template_path("add_wallets_idempotency_keys.rb.erb")), trim_mode: "-")
+      .result_with_hash(migration_version: "[7.2]")
+    dummy_migration = Dir[File.expand_path("../dummy/db/migrate/*_add_wallets_idempotency_keys.rb", __dir__)].sole
+
+    assert_equal rendered, File.read(dummy_migration)
+  end
+
+  test "both migration templates key transactions and holds the same way" do
+    install = File.read(template_path("create_wallets_tables.rb.erb"))
+    upgrade = File.read(template_path("add_wallets_idempotency_keys.rb.erb"))
+
+    assert_equal 2, install.scan("t.string :idempotency_key").size
+    assert_includes install, 'add_index transactions_table, [:wallet_id, :idempotency_key], unique: true, name: index_name("transactions_on_wallet_and_idempotency_key")'
+    assert_includes install, 't.index [:wallet_id, :idempotency_key], unique: true, name: index_name("holds_on_wallet_and_idempotency_key")'
+    assert_includes upgrade, "add_index table, [:wallet_id, :idempotency_key], unique: true, name: index_name(table)"
+    assert_includes upgrade, "\"index_\#{table}_on_wallet_and_idempotency_key\""
+  end
+
   test "initializer template keeps optional categories and table prefix commented out" do
     template = File.read(template_path("initializer.rb"))
 

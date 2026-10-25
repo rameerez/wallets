@@ -293,6 +293,27 @@ user.wallet(:coins).credit(
 
 Debits consume the soonest-expiring credits first, then the oldest. Expired value is never spent, and neither is held value (see [Holds and reservations](#holds-and-reservations)).
 
+### Retries and idempotency keys
+
+Webhooks arrive twice and jobs run again. Give a command an `idempotency_key:` and it posts once, however many times it runs:
+
+```ruby
+wallet.credit(5_000, category: :top_up, idempotency_key: "stripe:#{invoice.id}")
+wallet.credit(5_000, category: :top_up, idempotency_key: "stripe:#{invoice.id}") # => the same transaction, nothing added
+```
+
+`credit`, `debit`, `transfer_to`, `hold`, `reserve` and `capture!` all take one. The first call stores the key on the row it writes. A retry with the same key returns that row: no second posting, no callbacks, not even an `InvalidHold` for a reservation the first call already captured. That makes the reserve-then-capture pattern safe in an at-least-once job:
+
+```ruby
+reservation = wallet.reserve(estimate, category: :run, idempotency_key: "run:#{run.id}")
+# ... do the work ...
+reservation.capture!(actual, category: :run, idempotency_key: "run:#{run.id}")
+```
+
+Keys are unique per wallet, once among its transactions and once among its holds, so a reservation and its capture can share one. A retry must ask for the same thing: the same amount, category and target (the recipient of a transfer, the credit a hold covers, the reservation a capture charges). The same key for anything else raises `Wallets::IdempotencyConflict` and writes nothing. Metadata, deadlines and expirations are the first call's, so a retry that recomputes `1.hour.from_now` is still a retry. A command that failed or rolled back stored no key, so its retry runs for real. `release!` needs no key: releasing a hold that already ended does nothing.
+
+Duplicates that run at the same moment queue on the wallet's row lock, and the second one finds the first one's row. A unique index on `(wallet_id, idempotency_key)` backs that up in the database.
+
 ## Holds and reservations
 
 Sometimes value is in a wallet but must not be spent yet. A reward waits for validation. A seller's earnings wait out the return window. A booking sets money aside until the service is delivered. A fraud review freezes one credit, or the whole wallet. `wallets` models all of these with **holds**, and reads them the way your bank statement does:
@@ -554,7 +575,7 @@ rails db:migrate
 
 > **Migrate before the 0.4.0 code serves traffic.** The new code expects the holds table and the wallets' `ledger_revision` column. Until `rails db:migrate` has added them, reading a `Wallets::Wallet`'s balance, or running any command on it (an initial balance included), raises: a ledger that keeps holds fails loudly on purpose rather than treat held value as spendable. Deploy the migration first, then the code.
 
-The upgrade generator writes one migration that adds the holds table, and a `ledger_revision` column on the wallets table, to a 0.1, 0.2 or 0.3 install. It follows your `table_prefix`, and reads the key types from the tables you already have, uuid and unsigned keys included. Running it again never writes a second migration, and it writes none at all when both already exist. Rolling the migration back removes them only while the holds table is empty. Fresh installs get both from `rails generate wallets:install`.
+The upgrade generator writes up to two migrations. The first adds the holds table, and a `ledger_revision` column on the wallets table, to a 0.1, 0.2 or 0.3 install. The second adds the `idempotency_key` columns and their unique indexes (0.5) to any earlier install; until it has run, a command given a key raises instead of ignoring it, and commands without one work as before. It follows your `table_prefix`, and reads the key types from the tables you already have, uuid and unsigned keys included. Running it again never writes a duplicate, and it writes neither migration when the schema already has what it adds. Rolling the migration back removes them only while the holds table is empty. Fresh installs get both from `rails generate wallets:install`.
 
 Then look at where your app reads `wallet.balance`. It still means "what can be spent", so spending checks need no change. Screens and reports that mean "everything the user has", such as a total earned, should read `total_balance`. A reconciliation of the cached `balance` column compares it with `wallet.balance`, never with `total_balance`: the column stores the available balance, so reserving 30 of 100 leaves it at 70 while `total_balance` reads 100. Even then the two can differ through time alone, as credits expire and deadlines pass.
 
@@ -595,6 +616,7 @@ end
 - If your wallets can be destroyed, destroy their holds first. `Wallets::Wallet` does it in a `before_destroy` callback declared with `prepend: true`, so the holds go before the transactions they point at.
 - If you override `current_balance`, decide on purpose how it treats held and reserved value. With holds on, `balance`, `held_balance` and `total_balance` come from one set of terms. Overriding `current_balance` alone can break `total_balance == balance + held_balance`, so keep all three coherent.
 - `credit` now takes the keywords `hold:` and `available_at:`, and `debit` takes `from:`. If your transaction table has columns by those names, you can no longer pass them through `credit` or `debit` as extra attributes.
+- To accept idempotency keys, add a `string :idempotency_key` column and a unique index on `(wallet_id, idempotency_key)` to your transactions table, and to your holds table if you keep holds. A ledger without the column raises when a command is given a key, and works as before without one.
 
 ### Performance and concurrency
 

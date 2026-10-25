@@ -21,6 +21,8 @@ module Wallets
   class InvalidTransfer < Error; end
   class InvalidHold < Error; end
   class HoldsNotEnabled < Error; end
+  # An idempotency key the wallet already used for a different command.
+  class IdempotencyConflict < Error; end
 
   class << self
     attr_writer :configuration
